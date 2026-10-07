@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+show_help() {
+    cat <<'EOF'
+
+OPT - Central de otimização
+
+Uso:
+
+  opt
+      Abre um menu interativo.
+
+  opt video [arquivo]
+      Executa o videoopt.
+      Sem arquivo: processa os vídeos da pasta atual.
+      Com arquivo: processa somente o vídeo informado.
+
+  opt image
+  opt imagem
+      Executa o imgopt na pasta atual.
+
+  opt filler
+      Move arquivos da pasta atual para o volume VeraCrypt.
+
+Exemplos:
+
+  opt video "video.mp4"
+  opt video
+  opt image
+  opt imagem
+  opt filler
+
+EOF
+}
+
+run_video() {
+    shift || true
+    exec videoopt "$@"
+}
+
+run_image() {
+    exec imgopt
+}
+
+run_filler() {
+    exec filler
+}
+
+if [[ $# -gt 0 ]]; then
+    case "${1,,}" in
+        video|videos)
+            run_video "$@"
+            ;;
+
+        image|imagem|images|imagens)
+            run_image
+            ;;
+
+        filler|fill|veracrypt)
+            run_filler
+            ;;
+
+        help|-h|--help|ajuda)
+            show_help
+            exit 0
+            ;;
+
+        *)
+            echo "Comando desconhecido: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+fi
+
+clear
+
+echo "=========================================="
+echo "                 OPT"
+echo "=========================================="
+echo
+echo "Ferramentas disponíveis:"
+echo
+echo "  [1] VIDEO"
+echo "      Otimiza vídeos usando o LXC transcoder"
+echo "      e a GPU Intel."
+echo
+echo "  [2] IMAGE"
+echo "      Otimiza JPG, PNG e WEBP da pasta atual"
+echo "      usando processamento paralelo."
+echo
+echo "  [3] FILLER"
+echo "      Move arquivos da pasta atual para o"
+echo "      volume VeraCrypt até ele ficar cheio."
+echo
+echo "  [4] AJUDA"
+echo
+echo "  [0] SAIR"
+echo
+
+while true; do
+    read -r -p "Escolha [0-4]: " OPTION
+
+    case "$OPTION" in
+        1)
+            exec videoopt
+            ;;
+
+        2)
+            exec imgopt
+            ;;
+
+        3)
+            exec filler
+            ;;
+
+        4)
+            show_help
+            exit 0
+            ;;
+
+        0)
+            exit 0
+            ;;
+
+        *)
+            echo "Escolha entre 0 e 4."
+            ;;
+    esac
+done

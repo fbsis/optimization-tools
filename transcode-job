@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+INPUT="${1:?Informe o arquivo de entrada}"
+OUTPUT="${2:?Informe o arquivo de saída}"
+
+DEVICE="/dev/dri/renderD128"
+QP="${QP:-23}"
+
+if [[ ! -f "$INPUT" ]]; then
+    echo "Arquivo não encontrado: $INPUT"
+    exit 1
+fi
+
+echo "=========================================="
+echo "TRANSCODER INTEL GPU"
+echo "=========================================="
+echo "Entrada: $INPUT"
+echo "Saída:   $OUTPUT"
+echo "GPU:     $DEVICE"
+echo "Codec:   H.264 VAAPI"
+echo "QP:      $QP"
+echo "=========================================="
+
+ffmpeg \
+    -hide_banner \
+    -stats \
+    -vaapi_device "$DEVICE" \
+    -i "$INPUT" \
+    -map 0:v:0 \
+    -map 0:a? \
+    -map_metadata 0 \
+    -vf 'format=nv12,hwupload' \
+    -c:v h264_vaapi \
+    -profile:v high \
+    -qp "$QP" \
+    -c:a aac \
+    -b:a 128k \
+    -movflags +faststart \
+    "$OUTPUT"
+
+echo
+echo "Concluído:"
+du -h "$INPUT" "$OUTPUT"

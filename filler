@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+SOURCE="$(pwd)"
+DEST="/media/veracrypt64"
+
+RESERVE_BYTES=$((512 * 1024 * 1024))
+
+LOG_DIR="/var/log/filler"
+RUN_ID="$(date '+%Y%m%d-%H%M%S')"
+LOG_FILE="${LOG_DIR}/filler-${RUN_ID}.log"
+
+START_TIME="$(date +%s)"
+
+MOVED_BYTES=0
+MOVED_FILES=0
+FAILED_FILES=0
+SKIPPED_FILES=0
+
+human_bytes() {
+    numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "${1}B"
+}
+
+format_seconds() {
+    local total="$1"
+
+    printf '%02d:%02d:%02d' \
+        $((total / 3600)) \
+        $(((total % 3600) / 60)) \
+        $((total % 60))
+}
+
+log() {
+    printf '[%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$1" >> "$LOG_FILE"
+}
+
+available_bytes() {
+    df \
+        -B1 \
+        --output=avail \
+        "$DEST" 2>/dev/null |
+        tail -n 1 |
+        tr -d ' '
+}
+
+same_filesystem() {
+    local src_dev
+    local dst_dev
+
+    src_dev="$(stat -c '%d' "$1" 2>/dev/null)" || return 1
+    dst_dev="$(stat -c '%d' "$2" 2>/dev/null)" || return 1
+
+    [[ "$src_dev" == "$dst_dev" ]]
+}
+
+show_status() {
+    local now
+    local elapsed
+    local speed
+    local free
+    local usable
+    local eta
+
+    now="$(date +%s)"
+    elapsed=$((now - START_TIME))
+
+    free="$(available_bytes)"
+
+    [[ "$free" =~ ^[0-9]+$ ]] || free=0
+
+    usable=$((free - RESERVE_BYTES))
+
+    (( usable < 0 )) && usable=0
+
+    if (( elapsed > 0 )); then
+        speed=$((MOVED_BYTES / elapsed))
+    else
+        speed=0
+    fi
+
+    if (( speed > 0 )); then
+        eta=$((usable / speed))
+    else
+        eta=0
+    fi
+
+    printf '\r\033[K'
+
+    printf 'Movidos: %s | Arquivos: %d | Vel: %s/s | Livre: %s | ETA: %s | Tempo: %s' \
+        "$(human_bytes "$MOVED_BYTES")" \
+        "$MOVED_FILES" \
+        "$(human_bytes "$speed")" \
+        "$(human_bytes "$free")" \
+        "$(format_seconds "$eta")" \
+        "$(format_seconds "$elapsed")"
+}
+
+finish() {
+    local elapsed
+    local free
+
+    elapsed=$(($(date +%s) - START_TIME))
+    free="$(available_bytes)"
+
+    echo
+    echo
+    echo "=========================================="
+    echo "FILLER FINALIZADO"
+    echo "=========================================="
+    echo
+    echo "Origem:"
+    echo "  $SOURCE"
+    echo
+    echo "Destino:"
+    echo "  $DEST"
+    echo
+    echo "Movidos:"
+    echo "  $(human_bytes "$MOVED_BYTES")"
+    echo
+    echo "Arquivos:"
+    echo "  $MOVED_FILES"
+    echo
+    echo "Falhas:"
+    echo "  $FAILED_FILES"
+    echo
+    echo "Ignorados:"
+    echo "  $SKIPPED_FILES"
+    echo
+    echo "Tempo:"
+    echo "  $(format_seconds "$elapsed")"
+    echo
+    echo "Espaço livre:"
+    echo "  $(human_bytes "${free:-0}")"
+    echo
+    echo "Log:"
+    echo "  $LOG_FILE"
+    echo
+    echo "=========================================="
+}
+
+trap '
+    echo
+    log "Interrompido pelo usuário"
+    finish
+    exit 130
+' INT TERM
+
+if [[ ! -d "$DEST" ]]; then
+    echo "ERRO: destino não existe:"
+    echo "$DEST"
+    exit 1
+fi
+
+if ! mountpoint -q "$DEST"; then
+    echo "ERRO: VeraCrypt não parece montado em:"
+    echo "$DEST"
+    exit 1
+fi
+
+if [[ "$SOURCE" == "$DEST" ]]; then
+    echo "ERRO: origem e destino são iguais."
+    exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+
+clear
+
+echo "=========================================="
+echo "                 FILLER"
+echo "=========================================="
+echo
+echo "ORIGEM:"
+echo "  $SOURCE"
+echo
+echo "DESTINO:"
+echo "  $DEST"
+echo
+echo "ESPAÇO LIVRE:"
+echo "  $(human_bytes "$(available_bytes)")"
+echo
+echo "MARGEM RESERVADA:"
+echo "  $(human_bytes "$RESERVE_BYTES")"
+echo
+echo "Os arquivos serão MOVIDOS."
+echo
+echo "=========================================="
+echo
+
+while true; do
+    read -r -p "Confirma? [s/n]: " CONFIRM
+
+    case "${CONFIRM,,}" in
+        s|sim|y|yes)
+            break
+            ;;
+
+        n|nao|não|no)
+            echo
+            echo "Operação cancelada."
+            exit 0
+            ;;
+
+        *)
+            echo "Digite S ou N."
+            ;;
+    esac
+done
+
+touch "$LOG_FILE"
+
+log "Início"
+log "Origem: $SOURCE"
+log "Destino: $DEST"
+
+while IFS= read -r -d '' FILE; do
+    [[ -f "$FILE" ]] || continue
+
+    FILE_SIZE="$(stat -c '%s' "$FILE" 2>/dev/null)" || {
+        ((FAILED_FILES++))
+        log "ERRO stat: $FILE"
+        continue
+    }
+
+    FREE="$(available_bytes)"
+
+    if [[ ! "$FREE" =~ ^[0-9]+$ ]]; then
+        echo
+        echo "ERRO ao consultar espaço livre."
+        break
+    fi
+
+    USABLE=$((FREE - RESERVE_BYTES))
+
+    if (( USABLE <= 0 )); then
+        echo
+        echo "Volume atingiu a margem de segurança."
+
+        log "Volume cheio"
+        break
+    fi
+
+    if (( FILE_SIZE > USABLE )); then
+        ((SKIPPED_FILES++))
+
+        log "NÃO CABE: $FILE"
+        continue
+    fi
+
+    REL="${FILE#"$SOURCE"/}"
+
+    TARGET="$DEST/$REL"
+
+    TARGET_DIR="$(dirname "$TARGET")"
+
+    mkdir -p "$TARGET_DIR" || {
+        ((FAILED_FILES++))
+        log "ERRO mkdir: $TARGET_DIR"
+        continue
+    }
+
+    if [[ -e "$TARGET" ]]; then
+        ((SKIPPED_FILES++))
+
+        log "JÁ EXISTE: $TARGET"
+        continue
+    fi
+
+    if same_filesystem "$FILE" "$TARGET_DIR"; then
+        if mv -- "$FILE" "$TARGET"; then
+            MOVED_BYTES=$((MOVED_BYTES + FILE_SIZE))
+            ((MOVED_FILES++))
+
+            log "MOVIDO: $REL"
+        else
+            ((FAILED_FILES++))
+
+            log "ERRO mv: $FILE"
+        fi
+    else
+        if rsync \
+            -a \
+            --whole-file \
+            --remove-source-files \
+            --protect-args \
+            -- \
+            "$FILE" \
+            "$TARGET"; then
+
+            MOVED_BYTES=$((MOVED_BYTES + FILE_SIZE))
+            ((MOVED_FILES++))
+
+            log "MOVIDO: $REL"
+        else
+            ((FAILED_FILES++))
+
+            log "ERRO rsync: $FILE"
+        fi
+    fi
+
+    show_status
+
+done < <(
+    find "$SOURCE" \
+        -type f \
+        -print0
+)
+
+find "$SOURCE" \
+    -depth \
+    -type d \
+    -empty \
+    ! -path "$SOURCE" \
+    -delete 2>/dev/null || true
+
+finish

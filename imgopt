@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+SOURCE="$(pwd)"
+SOURCE_NAME="$(basename "$SOURCE")"
+SOURCE_PARENT="$(dirname "$SOURCE")"
+
+PARALLEL_DEST="${SOURCE_PARENT}/${SOURCE_NAME}-optimized"
+
+JPEG_QUALITY=82
+WEBP_QUALITY=82
+
+CPU_COUNT="$(nproc)"
+JOBS=$((CPU_COUNT / 2))
+
+(( JOBS < 1 )) && JOBS=1
+
+LOG_DIR="${HOME}/.local/share/imgopt"
+RUN_ID="$(date '+%Y%m%d-%H%M%S')"
+LOG_FILE="${LOG_DIR}/imgopt-${RUN_ID}.log"
+STATUS_DIR="/tmp/imgopt-${RUN_ID}"
+
+mkdir -p "$LOG_DIR" "$STATUS_DIR"
+
+if command -v magick >/dev/null 2>&1; then
+    IMG_CMD="magick"
+elif command -v convert >/dev/null 2>&1; then
+    IMG_CMD="convert"
+else
+    echo "ERRO: ImageMagick não está instalado."
+    echo
+    echo "Instale com:"
+    echo "  apt install -y imagemagick"
+    exit 1
+fi
+
+export IMG_CMD
+
+human_bytes() {
+    numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "${1}B"
+}
+
+cleanup() {
+    rm -rf "$STATUS_DIR"
+}
+
+trap cleanup EXIT
+
+optimize_file() {
+    local src="$1"
+    local source="$2"
+    local dest="$3"
+    local mode="$4"
+    local jpeg_quality="$5"
+    local webp_quality="$6"
+    local status_dir="$7"
+    local log_file="$8"
+
+    local rel
+    local target
+    local target_dir
+    local ext
+    local temp
+    local src_size
+    local new_size
+    local status_file
+
+    status_file="${status_dir}/${BASHPID}-$(date +%s%N)"
+
+    if [[ ! -f "$src" ]]; then
+        echo "FAIL|0|0" > "$status_file"
+        return 0
+    fi
+
+    rel="${src#"$source"/}"
+
+    if [[ "$mode" == "parallel" ]]; then
+        target="$dest/$rel"
+    else
+        target="$src"
+    fi
+
+    target_dir="$(dirname "$target")"
+
+    ext="${src##*.}"
+    ext="${ext,,}"
+
+    src_size="$(stat -c '%s' "$src" 2>/dev/null)" || {
+        echo "FAIL|0|0" > "$status_file"
+        return 0
+    }
+
+    temp="$(mktemp --suffix=".${ext}")"
+
+    case "$ext" in
+        jpg|jpeg)
+            if ! "$IMG_CMD" "$src" \
+                -auto-orient \
+                -strip \
+                -sampling-factor 4:2:0 \
+                -interlace Plane \
+                -quality "$jpeg_quality" \
+                "$temp"; then
+
+                rm -f "$temp"
+                echo "FAIL|$src_size|$src_size" > "$status_file"
+                return 0
+            fi
+            ;;
+
+        png)
+            if ! "$IMG_CMD" "$src" \
+                -strip \
+                -define png:compression-level=9 \
+                -define png:compression-strategy=1 \
+                "$temp"; then
+
+                rm -f "$temp"
+                echo "FAIL|$src_size|$src_size" > "$status_file"
+                return 0
+            fi
+            ;;
+
+        webp)
+            if ! "$IMG_CMD" "$src" \
+                -auto-orient \
+                -strip \
+                -quality "$webp_quality" \
+                "$temp"; then
+
+                rm -f "$temp"
+                echo "FAIL|$src_size|$src_size" > "$status_file"
+                return 0
+            fi
+            ;;
+
+        *)
+            rm -f "$temp"
+            echo "SKIP|$src_size|$src_size" > "$status_file"
+            return 0
+            ;;
+    esac
+
+    if [[ ! -s "$temp" ]]; then
+        rm -f "$temp"
+        echo "FAIL|$src_size|$src_size" > "$status_file"
+        return 0
+    fi
+
+    new_size="$(stat -c '%s' "$temp" 2>/dev/null || echo 0)"
+
+    if (( new_size <= 0 )); then
+        rm -f "$temp"
+        echo "FAIL|$src_size|$src_size" > "$status_file"
+        return 0
+    fi
+
+    if (( new_size >= src_size )); then
+        rm -f "$temp"
+
+        if [[ "$mode" == "parallel" ]]; then
+            mkdir -p "$target_dir"
+
+            if ! cp -a -- "$src" "$target"; then
+                echo "FAIL|$src_size|$src_size" > "$status_file"
+                return 0
+            fi
+        fi
+
+        echo "SKIP|$src_size|$src_size" > "$status_file"
+
+        printf '[%s] IGNORADO: %s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" \
+            "$src" >> "$log_file"
+
+        return 0
+    fi
+
+    if [[ "$mode" == "parallel" ]]; then
+        mkdir -p "$target_dir"
+
+        if ! mv -f -- "$temp" "$target"; then
+            rm -f "$temp"
+            echo "FAIL|$src_size|$src_size" > "$status_file"
+            return 0
+        fi
+
+        chmod --reference="$src" "$target" 2>/dev/null || true
+        chown --reference="$src" "$target" 2>/dev/null || true
+        touch -r "$src" "$target" 2>/dev/null || true
+    else
+        chmod --reference="$src" "$temp" 2>/dev/null || true
+        chown --reference="$src" "$temp" 2>/dev/null || true
+        touch -r "$src" "$temp" 2>/dev/null || true
+
+        if ! mv -f -- "$temp" "$src"; then
+            rm -f "$temp"
+            echo "FAIL|$src_size|$src_size" > "$status_file"
+            return 0
+        fi
+    fi
+
+    echo "OK|$src_size|$new_size" > "$status_file"
+
+    printf '[%s] OK: %s | %s -> %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$src" \
+        "$src_size" \
+        "$new_size" >> "$log_file"
+
+    return 0
+}
+
+export -f optimize_file
+
+clear
+
+echo "=========================================="
+echo "            IMGOPT PARALLEL"
+echo "=========================================="
+echo
+echo "Origem:"
+echo "  $SOURCE"
+echo
+echo "CPU:"
+echo "  $CPU_COUNT cores"
+echo
+echo "Workers sugeridos:"
+echo "  $JOBS"
+echo
+echo "  [1] Criar diretório paralelo:"
+echo "      $PARALLEL_DEST"
+echo
+echo "  [2] Substituir arquivos originais"
+echo
+echo "  [3] Cancelar"
+echo
+
+while true; do
+    read -r -p "Escolha [1/2/3]: " CHOICE
+
+    case "$CHOICE" in
+        1)
+            MODE="parallel"
+            DEST="$PARALLEL_DEST"
+            break
+            ;;
+        2)
+            MODE="replace"
+            DEST="$SOURCE"
+            break
+            ;;
+        3)
+            exit 0
+            ;;
+        *)
+            echo "Escolha 1, 2 ou 3."
+            ;;
+    esac
+done
+
+echo
+read -r -p "Quantos workers? [$JOBS]: " CUSTOM_JOBS
+
+if [[ -n "$CUSTOM_JOBS" ]]; then
+    if [[ "$CUSTOM_JOBS" =~ ^[0-9]+$ ]] &&
+       (( CUSTOM_JOBS > 0 )); then
+
+        JOBS="$CUSTOM_JOBS"
+    else
+        echo "Número inválido."
+        exit 1
+    fi
+fi
+
+echo
+read -r -p "Confirmar? [s/n]: " CONFIRM
+
+case "${CONFIRM,,}" in
+    s|sim|y|yes)
+        ;;
+    *)
+        echo "Cancelado."
+        exit 0
+        ;;
+esac
+
+if [[ "$MODE" == "parallel" ]]; then
+    mkdir -p "$DEST"
+fi
+
+touch "$LOG_FILE"
+
+echo
+echo "Contando imagens..."
+
+TOTAL_FILES="$(
+    find "$SOURCE" \
+        -type f \
+        \( \
+            -iname '*.jpg' \
+            -o -iname '*.jpeg' \
+            -o -iname '*.png' \
+            -o -iname '*.webp' \
+        \) \
+        -printf '.' |
+    wc -c
+)"
+
+if (( TOTAL_FILES == 0 )); then
+    echo
+    echo "Nenhuma imagem encontrada."
+    exit 0
+fi
+
+echo
+echo "Encontradas: $TOTAL_FILES imagens"
+echo "Workers:     $JOBS"
+echo
+
+START_TIME="$(date +%s)"
+
+find "$SOURCE" \
+    -type f \
+    \( \
+        -iname '*.jpg' \
+        -o -iname '*.jpeg' \
+        -o -iname '*.png' \
+        -o -iname '*.webp' \
+    \) \
+    -print0 |
+xargs \
+    -0 \
+    -P "$JOBS" \
+    -n 1 \
+    bash -c '
+        optimize_file \
+            "$8" \
+            "$1" \
+            "$2" \
+            "$3" \
+            "$4" \
+            "$5" \
+            "$6" \
+            "$7"
+    ' _ \
+    "$SOURCE" \
+    "$DEST" \
+    "$MODE" \
+    "$JPEG_QUALITY" \
+    "$WEBP_QUALITY" \
+    "$STATUS_DIR" \
+    "$LOG_FILE" &
+
+WORK_PID=$!
+
+while kill -0 "$WORK_PID" 2>/dev/null; do
+    PROCESSED=0
+    OPTIMIZED=0
+    SKIPPED=0
+    FAILED=0
+    ORIGINAL_BYTES=0
+    FINAL_BYTES=0
+
+    shopt -s nullglob
+
+    for STATUS in "$STATUS_DIR"/*; do
+        IFS='|' read -r RESULT OLD NEW < "$STATUS"
+
+        ((PROCESSED++))
+        ORIGINAL_BYTES=$((ORIGINAL_BYTES + OLD))
+        FINAL_BYTES=$((FINAL_BYTES + NEW))
+
+        case "$RESULT" in
+            OK)
+                ((OPTIMIZED++))
+                ;;
+            SKIP)
+                ((SKIPPED++))
+                ;;
+            FAIL)
+                ((FAILED++))
+                ;;
+        esac
+    done
+
+    shopt -u nullglob
+
+    PERCENT=$((PROCESSED * 100 / TOTAL_FILES))
+    SAVED=$((ORIGINAL_BYTES - FINAL_BYTES))
+
+    (( SAVED < 0 )) && SAVED=0
+
+    printf '\r\033[K'
+
+    printf '[%3d%%] %d/%d | OK: %d | Skip: %d | Erros: %d | Economia: %s | Workers: %d' \
+        "$PERCENT" \
+        "$PROCESSED" \
+        "$TOTAL_FILES" \
+        "$OPTIMIZED" \
+        "$SKIPPED" \
+        "$FAILED" \
+        "$(human_bytes "$SAVED")" \
+        "$JOBS"
+
+    sleep 1
+done
+
+wait "$WORK_PID"
+
+echo
+echo
+echo "Finalizado."
+echo "Log:"
+echo "  $LOG_FILE"
