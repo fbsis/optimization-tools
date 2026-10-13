@@ -131,6 +131,11 @@ CURRENT_JOB_ID=""
 
 CUR_NAME=""
 CUR_ORIG=0
+CUR_T0=0
+
+SESS_ORIG=0
+SESS_NEW=0
+FOUND=0
 
 START_TIME="$(date +%s)"
 
@@ -212,11 +217,23 @@ cleanup_current() {
     CURRENT_JOB_ID=""
 }
 
+record_session() {
+    local status="$1"
+    local seconds=$(( $(date +%s) - START_TIME ))
+
+    opt_session_add videoopt "${MODE:-replace}" "$status" \
+        "$FOUND" "$TOTAL" "$SUCCESS" "$SKIPPED" "$FAILED" \
+        "$SESS_ORIG" "$SESS_NEW" "$TOTAL_SAVED" "$seconds" \
+        "$HIST_SKIPPED" "$EFFICIENT_SKIPPED" "${PATH_ARGS[*]:-}"
+}
+
 on_signal() {
     echo
     log "Interrompido pelo usuário"
 
     cleanup_current
+
+    record_session canceled
 
     opt_emit ev=end status=canceled \
         ok#="$SUCCESS" skipped#="$SKIPPED" failed#="$FAILED" \
@@ -231,6 +248,8 @@ file_ok() {
     local saved="$1" new_size="$2"
 
     TOTAL_SAVED=$((TOTAL_SAVED + saved))
+    SESS_ORIG=$((SESS_ORIG + CUR_ORIG))
+    SESS_NEW=$((SESS_NEW + new_size))
 
     ((SUCCESS++))
     ((PROCESSED++))
@@ -344,6 +363,7 @@ convert_video() {
 
     CUR_NAME="$filename"
     CUR_ORIG="$(opt_file_size "$input")"
+    CUR_T0="$(opt_now_ms)"
 
     opt_emit ev=file i#="$((PROCESSED + 1))" total#="$TOTAL" \
         name="$filename" path="$input" size#="$CUR_ORIG"
@@ -452,7 +472,8 @@ convert_video() {
         CURRENT_LOCAL_TMP=""
 
         opt_history_add "$original_fp" video skip-larger \
-            "$original_size" "$new_size" videoopt vaapi-h264
+            "$original_size" "$new_size" videoopt vaapi-h264 \
+            "$(( $(opt_now_ms) - CUR_T0 ))" "$input"
 
         log "SKIP maior/igual: $input"
         file_skip "não reduziu o tamanho" "$new_size"
@@ -493,12 +514,14 @@ convert_video() {
 
     # Histórico: o arquivo novo passa a contar como já otimizado
     # (e o original também, útil no modo -optimized).
+    local file_ms=$(( $(opt_now_ms) - CUR_T0 ))
+
     opt_history_add "$(opt_fingerprint "$final_file")" video ok \
-        "$original_size" "$new_size" videoopt vaapi-h264
+        "$original_size" "$new_size" videoopt vaapi-h264 "$file_ms" "$input"
 
     if [[ "$MODE" == "optimized" ]]; then
         opt_history_add "$original_fp" video ok \
-            "$original_size" "$new_size" videoopt vaapi-h264
+            "$original_size" "$new_size" videoopt vaapi-h264 "$file_ms" "$input"
     fi
 
     echo
@@ -612,6 +635,9 @@ FOUND="${#FILES[@]}"
 # Filtro: histórico e vídeos já eficientes
 # ---------------------------------------------------------------------------
 
+echo
+echo "Verificando $FOUND vídeo(s): histórico e eficiência..."
+
 TODO_FILES=()
 TODO_FPS=()
 
@@ -622,8 +648,13 @@ for FILE in ${FILES[@]+"${FILES[@]}"}; do
 
     FP="$(opt_fingerprint "$FILE")" || FP=""
 
-    if (( SCANNED % 10 == 0 )); then
-        opt_emit ev=scan done#="$SCANNED" total#="$FOUND"
+    opt_emit ev=check i#="$SCANNED" total#="$FOUND" name="$(basename "$FILE")"
+
+    if [[ "$OPT_EVENTS" != "1" ]]; then
+        COLS="$(tput cols 2>/dev/null || echo 80)"
+        LABEL="$(basename "$FILE")"
+        printf '\r\033[K[%d/%d] Verificando: %s' \
+            "$SCANNED" "$FOUND" "${LABEL:0:$((COLS - 24))}"
     fi
 
     if [[ "$OPT_FORCE" != "1" ]]; then
@@ -636,7 +667,7 @@ for FILE in ${FILES[@]+"${FILES[@]}"}; do
             ((EFFICIENT_SKIPPED++))
 
             SIZE="$(opt_file_size "$FILE")"
-            opt_history_add "$FP" video efficient "$SIZE" "$SIZE" videoopt ""
+            opt_history_add "$FP" video efficient "$SIZE" "$SIZE" videoopt "" 0 "$FILE"
 
             log "SKIP eficiente: $FILE"
             continue
@@ -646,6 +677,8 @@ for FILE in ${FILES[@]+"${FILES[@]}"}; do
     TODO_FILES+=("$FILE")
     TODO_FPS+=("$FP")
 done
+
+[[ "$OPT_EVENTS" == "1" ]] || printf '\r\033[K'
 
 TOTAL="${#TODO_FILES[@]}"
 
@@ -761,6 +794,8 @@ done
 
 END_TIME="$(date +%s)"
 ELAPSED=$((END_TIME - START_TIME))
+
+record_session done
 
 opt_emit ev=end status=done \
     ok#="$SUCCESS" skipped#="$SKIPPED" failed#="$FAILED" \

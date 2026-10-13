@@ -53,10 +53,35 @@ opt_fingerprint() {
 }
 
 # ---------------------------------------------------------------------------
-# Histórico
-# Colunas: fingerprint kind status orig_size new_size data tool param
-# status: ok | skip-larger | efficient
+# Histórico (por arquivo) e sessões (por execução)
+#
+# history.tsv  : fingerprint kind status orig new data tool param ext ms session path
+#   status     : ok | skip-larger | efficient
+#   ext/ms/session/path são informativos (estatísticas); a identificação do
+#   arquivo usa só o fingerprint.
+# sessions.tsv : session inicio tool modo status achados a_fazer ok ignorados
+#                erros bytes_originais bytes_novos economia segundos ja_feitos
+#                eficientes pastas
 # ---------------------------------------------------------------------------
+
+OPT_SESSIONS="${OPT_SESSIONS:-${OPT_DATA_DIR}/sessions.tsv}"
+OPT_SESSION="${OPT_SESSION:-$(date '+%Y%m%d-%H%M%S')-$$}"
+
+export OPT_SESSIONS OPT_SESSION
+
+opt_now_ms() {
+    local t
+
+    t="$(date +%s%3N 2>/dev/null)"
+
+    [[ "$t" =~ ^[0-9]+$ ]] || t=$(( $(date +%s) * 1000 ))
+
+    echo "$t"
+}
+
+opt_clean_field() {
+    printf '%s' "$1" | tr '\t\r\n' '   '
+}
 
 opt_history_has() {
     local fp="$1"
@@ -66,16 +91,40 @@ opt_history_has() {
     grep -q "^${fp}	" "$OPT_HISTORY" 2>/dev/null
 }
 
+# opt_history_add fp kind status orig new tool param [ms] [path]
 opt_history_add() {
     local fp="$1" kind="$2" status="$3" orig="$4" new="$5" tool="$6" param="${7:-}"
+    local ms="${8:-0}" path="${9:-}"
+    local ext=""
 
     [[ -n "$fp" ]] || return 0
 
+    if [[ -n "$path" ]]; then
+        ext="${path##*.}"
+        ext="$(printf '%s' "$ext" | tr 'A-Z' 'a-z')"
+    fi
+
     mkdir -p "$OPT_DATA_DIR" 2>/dev/null || true
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$fp" "$kind" "$status" "$orig" "$new" \
-        "$(date '+%Y-%m-%dT%H:%M:%S')" "$tool" "$param" >> "$OPT_HISTORY"
+        "$(date '+%Y-%m-%dT%H:%M:%S')" "$tool" "$param" \
+        "$ext" "$ms" "$OPT_SESSION" "$(opt_clean_field "$path")" >> "$OPT_HISTORY"
+}
+
+# opt_session_add tool mode status found todo ok skipped failed orig_bytes new_bytes
+#                 saved seconds history_skipped efficient_skipped paths
+opt_session_add() {
+    local tool="$1" mode="$2" status="$3" found="$4" todo="$5" ok="$6"
+    local skipped="$7" failed="$8" orig="$9" new="${10}" saved="${11}"
+    local seconds="${12}" hist="${13}" eff="${14}" paths="${15:-}"
+
+    mkdir -p "$OPT_DATA_DIR" 2>/dev/null || true
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$OPT_SESSION" "$(date '+%Y-%m-%dT%H:%M:%S')" "$tool" "$mode" "$status" \
+        "$found" "$todo" "$ok" "$skipped" "$failed" "$orig" "$new" "$saved" \
+        "$seconds" "$hist" "$eff" "$(opt_clean_field "$paths")" >> "$OPT_SESSIONS"
 }
 
 # ---------------------------------------------------------------------------
@@ -204,4 +253,4 @@ opt_ensure_ffprobe() {
 }
 
 export -f opt_file_size opt_md5 opt_fingerprint opt_history_has opt_history_add \
-          opt_json_escape opt_emit
+          opt_json_escape opt_emit opt_now_ms opt_clean_field

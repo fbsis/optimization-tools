@@ -26,7 +26,7 @@ try:
     from textual import work
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Vertical
+    from textual.containers import Vertical, VerticalScroll
     from textual.screen import ModalScreen, Screen
     from textual.widgets import (
         DataTable,
@@ -35,6 +35,8 @@ try:
         OptionList,
         ProgressBar,
         Static,
+        TabbedContent,
+        TabPane,
     )
     from textual.widgets.option_list import Option
 except ImportError:  # pragma: no cover
@@ -43,6 +45,7 @@ except ImportError:  # pragma: no cover
 
 DATA_DIR = Path(os.environ.get("OPT_DATA_DIR", Path.home() / ".local/share/opt"))
 HISTORY_FILE = Path(os.environ.get("OPT_HISTORY", DATA_DIR / "history.tsv"))
+SESSIONS_FILE = Path(os.environ.get("OPT_SESSIONS", DATA_DIR / "sessions.tsv"))
 
 VIDEO_EXT = {"mp4", "mkv", "avi", "mov", "m4v", "webm", "mpg", "mpeg", "ts", "mts", "m2ts", "wmv"}
 IMAGE_EXT = {"jpg", "jpeg", "png", "webp"}
@@ -119,6 +122,38 @@ class Entry:
     date: str
     tool: str
     param: str
+    ext: str = ""
+    ms: int = 0
+    session: str = ""
+    path: str = ""
+
+
+@dataclass
+class Session:
+    id: str
+    end: str
+    tool: str
+    mode: str
+    status: str
+    found: int
+    todo: int
+    ok: int
+    skipped: int
+    failed: int
+    orig: int
+    new: int
+    saved: int
+    seconds: int
+    hist: int
+    eff: int
+    paths: str
+
+
+def _int(value: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 class History:
@@ -127,8 +162,35 @@ class History:
         self._mtime: float | None = None
         self.entries: list[Entry] = []
         self.fps: set[str] = set()
+        self.sessions: list[Session] = []
+        self._smtime: float | None = None
+
+    def refresh_sessions(self) -> None:
+        try:
+            mtime = SESSIONS_FILE.stat().st_mtime_ns
+        except OSError:
+            self.sessions, self._smtime = [], None
+            return
+        if mtime == self._smtime:
+            return
+        out = []
+        with open(SESSIONS_FILE, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                p = line.rstrip("\n").split("\t")
+                if len(p) < 16:
+                    continue
+                p += [""] * (17 - len(p))
+                out.append(Session(
+                    p[0], p[1], p[2], p[3], p[4],
+                    _int(p[5]), _int(p[6]), _int(p[7]), _int(p[8]), _int(p[9]),
+                    _int(p[10]), _int(p[11]), _int(p[12]), _int(p[13]),
+                    _int(p[14]), _int(p[15]), p[16],
+                ))
+        self.sessions = out
+        self._smtime = mtime
 
     def refresh(self) -> None:
+        self.refresh_sessions()
         try:
             mtime = self.path.stat().st_mtime_ns
         except OSError:
@@ -142,14 +204,12 @@ class History:
                 parts = line.rstrip("\n").split("\t")
                 if len(parts) < 7:
                     continue
-                parts += [""] * (8 - len(parts))
-                try:
-                    entries.append(
-                        Entry(parts[0], parts[1], parts[2], int(parts[3] or 0),
-                              int(parts[4] or 0), parts[5], parts[6], parts[7])
-                    )
-                except ValueError:
-                    continue
+                parts += [""] * (12 - len(parts))
+                entries.append(
+                    Entry(parts[0], parts[1], parts[2], _int(parts[3]), _int(parts[4]),
+                          parts[5], parts[6], parts[7], parts[8], _int(parts[9]),
+                          parts[10], parts[11])
+                )
         self.entries = entries
         self.fps = {e.fp for e in entries}
         self._mtime = mtime
@@ -214,7 +274,7 @@ class Scanner:
             self._cache[key] = fp
         return fp
 
-    def scan(self, root: str, recursive: bool = True, cancel=None) -> Stats:
+    def scan(self, root: str, recursive: bool = True, cancel=None, progress=None) -> Stats:
         stats = Stats()
         stack = [root]
         while stack:
@@ -240,6 +300,8 @@ class Scanner:
                     st = entry.stat(follow_symlinks=False)
                 except OSError:
                     continue
+                if progress:
+                    progress(entry.path)
                 ks = stats.video if kind == "video" else stats.image
                 ks.n += 1
                 ks.size += st.st_size
@@ -326,6 +388,8 @@ class BrowserScreen(Screen):
         self.copy_mode = False
         self.force = False
         self._resumed = False
+        self.scanning = ""
+        self.scan_active = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -339,6 +403,7 @@ class BrowserScreen(Screen):
         table = self.query_one(DataTable)
         table.add_columns("", "Pasta", "Arquivos", "Vídeos", "Imagens", "Otimizados", "Pendente")
         self.title = "opt · otimizar mídia"
+        self.set_interval(0.25, self.tick_scan)
         self.load()
 
     def on_screen_resume(self) -> None:
@@ -362,13 +427,20 @@ class BrowserScreen(Screen):
             )
         except OSError:
             self.dirs = []
+        self.scan_active = True
+        self.scanning = ""
         self.render_table()
         self.update_header()
+        self.update_summary()
         self.scan_worker(self.gen)
 
     def rescan(self) -> None:
         self.app.history.refresh()
         self.load()
+
+    def tick_scan(self) -> None:
+        if self.scan_active:
+            self.update_summary()
 
     @work(thread=True, group="scan")
     def scan_worker(self, gen: int) -> None:
@@ -379,14 +451,18 @@ class BrowserScreen(Screen):
         for name in list(self.dirs):
             if cancelled():
                 return
-            st = scanner.scan(str(self.cwd / name), cancel=cancelled)
+            st = scanner.scan(str(self.cwd / name), cancel=cancelled, progress=self.note_scan)
             if cancelled():
                 return
             self.app.call_from_thread(self.set_stats, gen, name, st)
 
-        here = scanner.scan(str(self.cwd), recursive=False, cancel=cancelled)
+        here = scanner.scan(str(self.cwd), recursive=False, cancel=cancelled,
+                            progress=self.note_scan)
         if not cancelled():
             self.app.call_from_thread(self.set_here, gen, here)
+
+    def note_scan(self, path: str) -> None:
+        self.scanning = path  # lido pelo timer da UI (atribuição de str é atômica)
 
     def set_stats(self, gen: int, name: str, st: Stats) -> None:
         if gen != self.gen:
@@ -399,6 +475,7 @@ class BrowserScreen(Screen):
         if gen != self.gen:
             return
         self.stats["."] = st
+        self.scan_active = False
         self.update_summary()
 
     # -- desenho -------------------------------------------------------
@@ -462,7 +539,14 @@ class BrowserScreen(Screen):
         for st in self.stats.values():
             total.add(st)
         scanned = len([k for k in self.stats if k != "."])
-        waiting = "" if scanned >= len(self.dirs) and "." in self.stats else "  (escaneando…)"
+        if self.scan_active:
+            try:
+                rel = os.path.relpath(self.scanning, self.cwd) if self.scanning else ""
+            except ValueError:
+                rel = self.scanning
+            waiting = f"\n[yellow]⟳ lendo ({scanned}/{len(self.dirs)} pastas):[/yellow] {rel}"
+        else:
+            waiting = ""
         v, i = total.video, total.image
         text = (
             f"Total aqui: {total.files} arquivos · "
@@ -722,7 +806,16 @@ class RunScreen(Screen):
         kind = ev.get("ev")
         cur = self.query_one("#current", Static)
 
-        if kind == "scan" and "todo" in ev:
+        if kind == "check":
+            i, tot = int(ev.get("i", 0)), max(int(ev.get("total", 1)), 1)
+            cur.update(f"Verificando {i}/{tot}  ·  {ev.get('name', '')}")
+            self.query_one("#stage", Static).update(
+                f"{self.step_label} · verificando histórico e eficiência"
+            )
+            self.query_one("#stagebar", ProgressBar).update(total=100, progress=int(i * 100 / tot))
+        elif kind == "scan" and ev.get("phase") == "find":
+            cur.update("Procurando imagens…")
+        elif kind == "scan" and "todo" in ev:
             cur.update(
                 f"{ev.get('todo', 0)} a processar · {ev.get('history', 0)} já otimizados "
                 f"(histórico) · {ev.get('efficient', 0)} já eficientes"
@@ -773,8 +866,9 @@ class RunScreen(Screen):
             self.skipped = b_skip + int(ev.get("skipped", 0)) + int(ev.get("history", 0))
             self.failed = b_fail + int(ev.get("failed", 0))
             self.saved = b_saved + int(ev.get("saved", 0))
+            reading = f"\nlendo: {ev['name']}" if ev.get("name") else ""
             cur.update(
-                f"{done}/{tot} imagens · {ev.get('history', 0)} já otimizadas (histórico)"
+                f"{done}/{tot} imagens · {ev.get('history', 0)} já otimizadas (histórico){reading}"
             )
             self.query_one("#stage", Static).update(f"{self.step_label} · processando em paralelo")
             self.query_one("#stagebar", ProgressBar).update(total=100, progress=int(done * 100 / tot))
@@ -861,6 +955,198 @@ class HistoryScreen(Screen):
 
 
 # ---------------------------------------------------------------------------
+# Estatísticas
+# ---------------------------------------------------------------------------
+
+def pct(part: float, whole: float) -> str:
+    return f"{part * 100 / whole:.0f}%" if whole else "–"
+
+
+def saved_of(e: Entry) -> int:
+    return max(e.orig - e.new, 0) if e.status == "ok" else 0
+
+
+class StatsScreen(Screen):
+    BINDINGS = [Binding("escape,q", "back", "Menu"), Binding("r", "reload", "Atualizar")]
+
+    DEFAULT_CSS = """
+    StatsScreen DataTable { height: 1fr; }
+    StatsScreen VerticalScroll { padding: 1 2; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with TabbedContent():
+            with TabPane("Resumo"):
+                with VerticalScroll():
+                    yield Static(id="st_summary")
+            with TabPane("Por tipo/formato"):
+                yield DataTable(id="st_ext", cursor_type="row", zebra_stripes=True)
+            with TabPane("Por dia"):
+                yield DataTable(id="st_days", cursor_type="row", zebra_stripes=True)
+            with TabPane("Sessões"):
+                yield DataTable(id="st_sessions", cursor_type="row", zebra_stripes=True)
+            with TabPane("Maiores economias"):
+                yield DataTable(id="st_top", cursor_type="row", zebra_stripes=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = "opt · estatísticas"
+        for tid, cols in (
+            ("st_ext", ("Tipo", "Formato", "Otimizados", "Sem ganho", "Já eficientes",
+                        "Original", "Novo", "Economia", "Redução", "Tempo médio")),
+            ("st_days", ("Dia", "Otimizados", "Original", "Economia", "Redução", "Sessões", "Tempo")),
+            ("st_sessions", ("Início/fim", "Ferramenta", "Modo", "Status", "Duração", "Achados",
+                             "Já feitos", "Eficientes", "OK", "Sem ganho", "Erros", "Economia",
+                             "Vazão", "Arq/h")),
+            ("st_top", ("Economia", "Redução", "Original", "Tipo", "Arquivo")),
+        ):
+            self.query_one(f"#{tid}", DataTable).add_columns(*cols)
+        self.action_reload()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_reload(self) -> None:
+        history: History = self.app.history
+        history.refresh()
+        self.fill_summary(history)
+        self.fill_formats(history.entries)
+        self.fill_days(history)
+        self.fill_sessions(history.sessions)
+        self.fill_top(history.entries)
+
+    # -- resumo --------------------------------------------------------
+
+    def fill_summary(self, history: History) -> None:
+        entries, sessions = history.entries, history.sessions
+        ok = [e for e in entries if e.status == "ok"]
+        skip = [e for e in entries if e.status == "skip-larger"]
+        eff = [e for e in entries if e.status == "efficient"]
+        orig = sum(e.orig for e in ok)
+        new = sum(e.new for e in ok)
+        saved = orig - new
+        done = [s for s in sessions if s.status == "done"]
+        total_secs = sum(s.seconds for s in sessions)
+        proc_orig = sum(s.orig for s in sessions)
+        failed = sum(s.failed for s in sessions)
+        canceled = len([s for s in sessions if s.status == "canceled"])
+
+        def period(days: int) -> str:
+            cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
+            sel = [e for e in ok if e.date[:10] >= cutoff]
+            return f"{len(sel)} arquivos · {human(sum(saved_of(e) for e in sel))}"
+
+        by_kind = []
+        for kind, label in (("video", "Vídeos"), ("image", "Imagens")):
+            k_ok = [e for e in ok if e.kind == kind]
+            k_orig = sum(e.orig for e in k_ok)
+            k_saved = sum(saved_of(e) for e in k_ok)
+            by_kind.append(
+                f"  {label:<8} {len(k_ok):>6} otimizados · economia {human(k_saved):>10} "
+                f"({pct(k_saved, k_orig)})"
+            )
+
+        avg_secs = total_secs / len(sessions) if sessions else 0
+        rate = proc_orig / total_secs * 3600 if total_secs else 0
+        files_h = sum(s.ok for s in sessions) / total_secs * 3600 if total_secs else 0
+        text = (
+            f"[b]Arquivos[/b]\\n"
+            f"  Registrados:        {len(entries)}\\n"
+            f"  [green]Otimizados:[/green]         {len(ok)}   (taxa de sucesso {pct(len(ok), len(ok) + len(skip))})\\n"
+            f"  [yellow]Sem ganho:[/yellow]          {len(skip)}   (conversão não reduziu o tamanho)\\n"
+            f"  Já eficientes:      {len(eff)}   (pulados pelo ffprobe)\\n"
+            f"  Erros (sessões):    {failed}\\n\\n"
+            f"[b]Espaço[/b]\\n"
+            f"  Original → novo:    {human(orig)} → {human(new)}\\n"
+            f"  [b]Economia total:     {human(saved)}[/b]  ({pct(saved, orig)} de redução)\\n"
+            f"  Média por arquivo:  {human(saved / len(ok)) if ok else '–'}\\n\\n"
+            f"[b]Por tipo[/b]\\n" + "\\n".join(by_kind) + "\\n\\n"
+            f"[b]Período[/b]\\n"
+            f"  Hoje:               {period(0)}\\n"
+            f"  Últimos 7 dias:     {period(7)}\\n"
+            f"  Últimos 30 dias:    {period(30)}\\n\\n"
+            f"[b]Sessões[/b]\\n"
+            f"  Execuções:          {len(sessions)}   ({len(done)} concluídas, {canceled} canceladas)\\n"
+            f"  Tempo total:        {hms(total_secs)}   (média {hms(avg_secs)} por sessão)\\n"
+            f"  Vazão média:        {human(rate)}/h de originais · {files_h:.0f} arquivos/h\\n\\n"
+            f"[dim]{HISTORY_FILE}\\n{SESSIONS_FILE}[/dim]"
+        )
+        if not entries and not sessions:
+            text = "Ainda não há dados. Rode uma otimização e volte aqui."
+        self.query_one("#st_summary", Static).update(text)
+
+    # -- tipo/formato --------------------------------------------------
+
+    def fill_formats(self, entries: list[Entry]) -> None:
+        table = self.query_one("#st_ext", DataTable)
+        table.clear()
+        groups: dict[tuple[str, str], list[Entry]] = {}
+        for e in entries:
+            groups.setdefault((e.kind, e.ext or "?"), []).append(e)
+        rows = []
+        for (kind, ext), items in groups.items():
+            ok = [e for e in items if e.status == "ok"]
+            orig = sum(e.orig for e in ok)
+            saved = sum(saved_of(e) for e in ok)
+            timed = [e.ms for e in ok if e.ms > 0]
+            avg = f"{sum(timed) / len(timed) / 1000:.1f}s" if timed else "–"
+            rows.append((saved, (
+                "vídeo" if kind == "video" else "imagem", ext, str(len(ok)),
+                str(len([e for e in items if e.status == "skip-larger"])),
+                str(len([e for e in items if e.status == "efficient"])),
+                human(orig), human(orig - saved), human(saved), pct(saved, orig), avg)))
+        for _, row in sorted(rows, key=lambda r: r[0], reverse=True):
+            table.add_row(*row)
+
+    # -- por dia -------------------------------------------------------
+
+    def fill_days(self, history: History) -> None:
+        table = self.query_one("#st_days", DataTable)
+        table.clear()
+        days: dict[str, dict] = {}
+        for e in history.entries:
+            if e.status != "ok":
+                continue
+            d = days.setdefault(e.date[:10], {"n": 0, "orig": 0, "saved": 0, "sess": 0, "secs": 0})
+            d["n"] += 1
+            d["orig"] += e.orig
+            d["saved"] += saved_of(e)
+        for s in history.sessions:
+            d = days.setdefault(s.end[:10], {"n": 0, "orig": 0, "saved": 0, "sess": 0, "secs": 0})
+            d["sess"] += 1
+            d["secs"] += s.seconds
+        for day in sorted(days, reverse=True)[:90]:
+            d = days[day]
+            table.add_row(day, str(d["n"]), human(d["orig"]), human(d["saved"]),
+                          pct(d["saved"], d["orig"]), str(d["sess"]), hms(d["secs"]))
+
+    # -- sessões -------------------------------------------------------
+
+    def fill_sessions(self, sessions: list[Session]) -> None:
+        table = self.query_one("#st_sessions", DataTable)
+        table.clear()
+        for s in reversed(sessions[-300:]):
+            rate = f"{human(s.orig / s.seconds * 3600)}/h" if s.seconds and s.orig else "–"
+            files_h = f"{s.ok / s.seconds * 3600:.0f}" if s.seconds and s.ok else "–"
+            status = {"done": Text("concluída", style="green"),
+                      "canceled": Text("cancelada", style="yellow")}.get(s.status, Text(s.status))
+            table.add_row(s.end.replace("T", " "), s.tool, s.mode, status, hms(s.seconds),
+                          str(s.found), str(s.hist), str(s.eff), str(s.ok), str(s.skipped),
+                          str(s.failed), human(s.saved), rate, files_h)
+
+    # -- top -----------------------------------------------------------
+
+    def fill_top(self, entries: list[Entry]) -> None:
+        table = self.query_one("#st_top", DataTable)
+        table.clear()
+        top = sorted((e for e in entries if e.status == "ok"), key=saved_of, reverse=True)[:30]
+        for e in top:
+            table.add_row(human(saved_of(e)), pct(saved_of(e), e.orig), human(e.orig),
+                          e.kind, e.path or "(sem caminho: registro antigo)")
+
+
+# ---------------------------------------------------------------------------
 # App / menu
 # ---------------------------------------------------------------------------
 
@@ -886,6 +1172,7 @@ class OptApp(App):
         yield OptionList(
             Option("🎬  Navegar pastas e otimizar        [dim]vídeos + imagens[/dim]", id="browse"),
             Option(f"⚡  Otimizar a pasta atual            [dim]{self.start.name or '/'}[/dim]", id="here"),
+            Option("📊  Estatísticas                     [dim]economia, tempo, sessões[/dim]", id="stats"),
             Option("🕘  Histórico                        [dim]o que já foi feito[/dim]", id="history"),
             Option("📦  Filler                           [dim]mover p/ VeraCrypt[/dim]", id="filler"),
             Option("✖   Sair", id="quit"),
@@ -914,6 +1201,8 @@ class OptApp(App):
                     self.push_screen(RunScreen([str(self.start)], True, True, False, False))
 
             self.push_screen(Confirm(text), after)
+        elif choice == "stats":
+            self.push_screen(StatsScreen())
         elif choice == "history":
             self.push_screen(HistoryScreen())
         elif choice == "filler":

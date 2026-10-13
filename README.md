@@ -717,6 +717,10 @@ Telas:
 - **Execução**: progresso geral, etapa atual (enviando, convertendo, recebendo),
   tabela por arquivo, economia e tempo. `c` cancela e limpa o job remoto.
 - **Histórico**: tudo o que já foi otimizado e a economia total.
+- **Estatísticas**: resumo geral (otimizados, sem ganho, já eficientes, taxa de
+  sucesso, economia e % de redução), por tipo e formato (qual compensa mais, tempo
+  médio por arquivo), por dia, por sessão (duração, vazão em GiB/h e arquivos/h,
+  concluída ou cancelada) e as maiores economias.
 
 A TUI só dispara os motores `videoopt` e `imgopt` com `--events` (JSON lines);
 os scripts continuam funcionando sozinhos pela linha de comando.
@@ -752,7 +756,20 @@ fingerprint  tipo  status  original  novo  data  ferramenta  parâmetros
 opt history
 ```
 
-mostra um resumo.
+mostra um resumo, e
+
+```bash
+opt stats
+```
+
+mostra as estatísticas no terminal (sem precisar da TUI).
+
+Além do `history.tsv` (por arquivo), cada execução grava uma linha em
+`~/.local/share/opt/sessions.tsv` (início, ferramenta, modo, status, achados,
+já feitos, eficientes, ok, sem ganho, erros, bytes, economia, duração e pastas).
+O `history.tsv` também guarda formato, tempo de processamento, sessão e caminho
+(só informativos; a identificação continua sendo só o hash). Registros antigos
+de 8 colunas continuam válidos.
 
 ---
 

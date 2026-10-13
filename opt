@@ -19,6 +19,10 @@ Uso:
   opt history
       Mostra o resumo do histórico de otimizações.
 
+  opt stats
+      Estatísticas: otimizados, sem ganho, economia por tipo/formato,
+      por dia e por sessão (tempo e vazão).
+
   opt video [arquivo]
       Executa o videoopt.
       Sem arquivo: processa os vídeos da pasta atual.
@@ -82,6 +86,76 @@ run_history() {
 # OPT_PYTHON permite apontar para um venv onde o textual esteja instalado.
 OPT_PYTHON="${OPT_PYTHON:-python3}"
 
+run_stats() {
+    local dir="${OPT_DATA_DIR:-$HOME/.local/share/opt}"
+    local history="${OPT_HISTORY:-$dir/history.tsv}"
+    local sessions="${OPT_SESSIONS:-$dir/sessions.tsv}"
+
+    if [[ ! -s "$history" && ! -s "$sessions" ]]; then
+        echo "Ainda não há dados. Rode uma otimização primeiro."
+        exit 0
+    fi
+
+    if [[ -s "$history" ]]; then
+        awk -F'\t' '
+            function gib(b) { return sprintf("%.2f GiB", b / 1073741824) }
+            function pc(a, b) { return b > 0 ? sprintf("%.0f%%", a * 100 / b) : "-" }
+            { n++; st[$3]++ }
+            $3 == "ok" {
+                saved = $4 - $5
+                orig += $4; new += $5; tot += saved
+                k = $2; ko[k]++; kor[k] += $4; ks[k] += saved
+                e = ($9 == "" ? "?" : $9); key = k " " e
+                eo[key]++; es[key] += saved; eor[key] += $4
+                d = substr($6, 1, 10); dn[d]++; ds[d] += saved
+                if ($10 > 0) { ms[k] += $10; mc[k]++ }
+            }
+            END {
+                printf "== Arquivos ==\n"
+                printf "Registrados:   %d\n", n
+                printf "Otimizados:    %d (sucesso %s)\n", st["ok"], pc(st["ok"], st["ok"] + st["skip-larger"])
+                printf "Sem ganho:     %d\n", st["skip-larger"]
+                printf "Já eficientes: %d\n\n", st["efficient"]
+                printf "== Espaço ==\n"
+                printf "Original -> novo: %s -> %s\n", gib(orig), gib(new)
+                printf "Economia total:   %s (%s)\n", gib(tot), pc(tot, orig)
+                if (st["ok"] > 0) printf "Média/arquivo:    %.1f MiB\n", tot / st["ok"] / 1048576
+                printf "\n== Por tipo ==\n"
+                for (k in ko) {
+                    printf "%-7s %6d otimizados  economia %s (%s)", k, ko[k], gib(ks[k]), pc(ks[k], kor[k])
+                    if (mc[k] > 0) printf "  tempo médio %.1fs", ms[k] / mc[k] / 1000
+                    printf "\n"
+                }
+                printf "\n== Por formato ==\n"
+                for (x in eo) printf "%-12s %6d  economia %s (%s)\n", x, eo[x], gib(es[x]), pc(es[x], eor[x])
+                printf "\n== Últimos dias ==\n"
+                for (d in dn) printf "%s %5d arquivos  %s\n", d, dn[d], gib(ds[d])
+            }
+        ' "$history"
+    fi
+
+    if [[ -s "$sessions" ]]; then
+        echo
+        echo "== Sessões =="
+
+        awk -F'\t' '
+            function hms(s) { return sprintf("%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60) }
+            { n++; secs += $14; proc += $11; ok += $8; fail += $10; if ($5 == "canceled") canc++
+              last[n] = sprintf("%s  %-8s %-9s %s  ok %d  ign %d  err %d  economia %.2f GiB", \
+                  $2, $3, $5, hms($14), $8, $9, $10, $13 / 1073741824) }
+            END {
+                printf "Execuções:   %d (%d canceladas)\n", n, canc
+                printf "Tempo total: %s (média %s)\n", hms(secs), hms(n ? secs / n : 0)
+                if (secs > 0) printf "Vazão média: %.2f GiB/h · %.0f arquivos/h\n", proc / secs * 3600 / 1073741824, ok / secs * 3600
+                printf "Erros:       %d\n\nÚltimas sessões:\n", fail
+                for (i = (n > 5 ? n - 4 : 1); i <= n; i++) print "  " last[i]
+            }
+        ' "$sessions"
+    fi
+
+    exit 0
+}
+
 tui_available() {
     command -v opt-tui >/dev/null 2>&1 &&
         "$OPT_PYTHON" -c 'import textual' >/dev/null 2>&1
@@ -112,6 +186,10 @@ if [[ $# -gt 0 ]]; then
 
         history|historico|histórico)
             run_history
+            ;;
+
+        stats|estatisticas|estatísticas)
+            run_stats
             ;;
 
         video|videos)
