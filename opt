@@ -10,16 +10,23 @@ OPT - Central de otimização
 Uso:
 
   opt
-      Abre um menu interativo.
+      Abre a interface TUI (se o Python/Textual estiver instalado)
+      ou o menu de texto clássico.
+
+  opt --classic
+      Força o menu de texto clássico.
+
+  opt history
+      Mostra o resumo do histórico de otimizações.
 
   opt video [arquivo]
       Executa o videoopt.
       Sem arquivo: processa os vídeos da pasta atual.
       Com arquivo: processa somente o vídeo informado.
 
-  opt image
+  opt image [pasta ...]
   opt imagem
-      Executa o imgopt na pasta atual.
+      Executa o imgopt na pasta atual (ou nas pastas informadas).
 
   opt filler
       Move arquivos da pasta atual para o volume VeraCrypt.
@@ -41,7 +48,47 @@ run_video() {
 }
 
 run_image() {
-    exec imgopt
+    shift || true
+    exec imgopt "$@"
+}
+
+run_history() {
+    local file="${OPT_HISTORY:-${OPT_DATA_DIR:-$HOME/.local/share/opt}/history.tsv}"
+
+    if [[ ! -s "$file" ]]; then
+        echo "Histórico vazio ($file)"
+        exit 0
+    fi
+
+    awk -F'\t' '
+        { total++; st[$3]++; kind[$2]++ }
+        $3 == "ok" { saved += $4 - $5 }
+        END {
+            printf "Registros:   %d\n", total
+            printf "Otimizados:  %d\n", st["ok"]
+            printf "Sem ganho:   %d\n", st["skip-larger"]
+            printf "Eficientes:  %d\n", st["efficient"]
+            printf "Vídeos:      %d\n", kind["video"]
+            printf "Imagens:     %d\n", kind["image"]
+            printf "Economia:    %.2f GiB\n", saved / 1073741824
+        }
+    ' "$file"
+
+    echo
+    echo "Arquivo: $file"
+    exit 0
+}
+
+# OPT_PYTHON permite apontar para um venv onde o textual esteja instalado.
+OPT_PYTHON="${OPT_PYTHON:-python3}"
+
+tui_available() {
+    command -v opt-tui >/dev/null 2>&1 &&
+        "$OPT_PYTHON" -c 'import textual' >/dev/null 2>&1
+}
+
+run_tui() {
+    exec "$OPT_PYTHON" "$(command -v opt-tui)" "$@"
 }
 
 run_filler() {
@@ -50,12 +97,29 @@ run_filler() {
 
 if [[ $# -gt 0 ]]; then
     case "${1,,}" in
+        --classic|classic)
+            ;;
+
+        tui)
+            if tui_available; then
+                shift
+                run_tui "$@"
+            fi
+
+            echo "TUI indisponível. Instale: pipx install textual (ou pip install textual)"
+            exit 1
+            ;;
+
+        history|historico|histórico)
+            run_history
+            ;;
+
         video|videos)
             run_video "$@"
             ;;
 
         image|imagem|images|imagens)
-            run_image
+            run_image "$@"
             ;;
 
         filler|fill|veracrypt)
@@ -73,6 +137,10 @@ if [[ $# -gt 0 ]]; then
             exit 1
             ;;
     esac
+fi
+
+if [[ "${1:-}" != "--classic" && "${1:-}" != "classic" ]] && tui_available; then
+    run_tui
 fi
 
 clear

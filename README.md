@@ -9,6 +9,8 @@ Ferramentas pessoais para otimização de vídeos, imagens e movimentação de a
 - `transcode-job`
 - `imgopt`
 - `filler`
+- `opt-tui` (interface de terminal)
+- `optlib.sh` (biblioteca compartilhada: histórico, eventos)
 
 ---
 
@@ -48,8 +50,13 @@ sudo apt update
 sudo apt install -y \
     rsync \
     openssh-client \
-    imagemagick
+    imagemagick \
+    ffmpeg
 ```
+
+O `ffmpeg` (que traz o `ffprobe`) é **requisito do `videoopt`**: ele verifica na
+partida e aborta se não encontrar. É com o `ffprobe` que os vídeos já eficientes
+são pulados.
 
 Instale os comandos:
 
@@ -58,6 +65,17 @@ sudo install -m 0755 opt /usr/local/bin/opt
 sudo install -m 0755 videoopt /usr/local/bin/videoopt
 sudo install -m 0755 imgopt /usr/local/bin/imgopt
 sudo install -m 0755 filler /usr/local/bin/filler
+sudo install -m 0755 opt-tui /usr/local/bin/opt-tui
+sudo install -D -m 0644 optlib.sh /usr/local/lib/opt/optlib.sh
+```
+
+Dependências opcionais na VM cliente:
+
+```bash
+# TUI (se não instalar, o opt usa o menu de texto clássico)
+sudo apt install -y python3-textual
+# ou: python3 -m pip install --user textual
+# ou, num venv:  OPT_PYTHON=/caminho/venv/bin/python opt
 ```
 
 Verifique:
@@ -325,7 +343,7 @@ Ao executar:
 
 ```text
 [1] Criar arquivo -optimized.mp4
-[2] Substituir original
+[2] Substituir original (padrão)
 [3] Cancelar
 ```
 
@@ -462,7 +480,7 @@ O script apresenta:
 
 ```text
 [1] Criar diretório paralelo
-[2] Substituir arquivos originais
+[2] Substituir arquivos originais (padrão)
 [3] Cancelar
 ```
 
@@ -660,3 +678,86 @@ vira:
 ## Diretórios vazios
 
 Ao terminar, o `filler` remove diretórios vazios restantes
+
+---
+
+# Padrões rápidos
+
+Em `videoopt`, `imgopt` e `filler`, apertar **Enter** escolhe o padrão:
+
+- Modo: `[2] Substituir original` (sem criar `-optimized.mp4` nem diretório paralelo)
+- Confirmação: `[S/n]` — Enter ou `s` confirma, `n` cancela
+- Workers do `imgopt`: Enter usa o valor sugerido
+
+
+---
+
+# Interface TUI
+
+```bash
+opt
+```
+
+Abre uma interface em tela cheia **dentro do mesmo terminal** (como `htop`/`vim`);
+ao sair (`q`), o terminal volta como estava. Se o Python/Textual não estiver
+instalado, o `opt` cai no menu de texto clássico. Para forçar o clássico:
+
+```bash
+opt --classic
+```
+
+Telas:
+
+- **Navegar pastas**: lista as subpastas com número de arquivos, vídeos (qtde · MB),
+  imagens (qtde · MB), quantos já foram otimizados e o que está pendente.
+  `Enter` entra, `Backspace` sobe, `Espaço` marca, `a` marca tudo, `o` otimiza
+  (as marcadas, ou a pasta atual), `v`/`i` ligam e desligam vídeos/imagens,
+  `m` alterna substituir/criar cópia, `f` ignora o histórico, `r` reescaneia.
+- **Execução**: progresso geral, etapa atual (enviando, convertendo, recebendo),
+  tabela por arquivo, economia e tempo. `c` cancela e limpa o job remoto.
+- **Histórico**: tudo o que já foi otimizado e a economia total.
+
+A TUI só dispara os motores `videoopt` e `imgopt` com `--events` (JSON lines);
+os scripts continuam funcionando sozinhos pela linha de comando.
+
+---
+
+# Histórico de otimizações
+
+Arquivo texto (sem banco de dados):
+
+```text
+~/.local/share/opt/history.tsv
+```
+
+Colunas (separadas por TAB):
+
+```text
+fingerprint  tipo  status  original  novo  data  ferramenta  parâmetros
+```
+
+- O `fingerprint` é `tamanho-md5` de 3 blocos de 64 KiB (início, meio e fim). Não
+  depende do nome nem do caminho: arquivo movido ou renomeado continua reconhecido.
+- Depois de substituir um arquivo, o **arquivo novo** é registrado, então a
+  próxima execução não reprocessa.
+- `skip-larger`: a conversão não reduziu o tamanho, não tenta de novo.
+- `efficient`: vídeo já eficiente (HEVC/AV1/VP9, ou H.264 com bits/pixel abaixo
+  de `OPT_EFFICIENT_BPP`, padrão `0.08`). Requer `ffprobe` na VM cliente (o `videoopt` aborta sem ele).
+- Para reprocessar tudo: `videoopt --force` / `imgopt --force` (ou `f` na TUI).
+- No `imgopt`, o modo "criar diretório paralelo" ignora o histórico para copiar
+  a árvore completa.
+
+```bash
+opt history
+```
+
+mostra um resumo.
+
+---
+
+# Opções dos motores
+
+```bash
+videoopt [--mode replace|optimized] [-y] [--force] [--events] [arquivo|pasta ...]
+imgopt   [--mode replace|parallel]  [--jobs N] [-y] [--force] [--events] [pasta ...]
+```

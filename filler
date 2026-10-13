@@ -191,10 +191,10 @@ echo "=========================================="
 echo
 
 while true; do
-    read -r -p "Confirma? [s/n]: " CONFIRM
+    read -r -p "Confirma? [S/n]: " CONFIRM
 
     case "${CONFIRM,,}" in
-        s|sim|y|yes)
+        ""|s|sim|y|yes)
             break
             ;;
 

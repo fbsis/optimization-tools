@@ -13,6 +13,49 @@ if [[ ! -f "$INPUT" ]]; then
     exit 1
 fi
 
+if [[ "${MACHINE:-0}" == "1" ]]; then
+    # Modo máquina: só imprime "PCT <n>" (usado pela TUI via videoopt --events).
+    DURATION="$(
+        ffprobe -v error \
+            -show_entries format=duration \
+            -of default=nw=1:nk=1 \
+            "$INPUT" 2>/dev/null || echo 0
+    )"
+
+    ffmpeg \
+        -hide_banner \
+        -nostats \
+        -loglevel error \
+        -progress pipe:1 \
+        -vaapi_device "$DEVICE" \
+        -i "$INPUT" \
+        -map 0:v:0 \
+        -map 0:a? \
+        -map_metadata 0 \
+        -vf 'format=nv12,hwupload' \
+        -c:v h264_vaapi \
+        -profile:v high \
+        -qp "$QP" \
+        -c:a aac \
+        -b:a 128k \
+        -movflags +faststart \
+        -y \
+        "$OUTPUT" |
+    awk -F= -v dur="$DURATION" '
+        $1 == "out_time_us" && dur + 0 > 0 {
+            pct = int(($2 / 1000000) * 100 / dur)
+            if (pct > 100) pct = 100
+            if (pct != last && pct >= 0) {
+                print "PCT " pct
+                fflush()
+                last = pct
+            }
+        }
+    '
+
+    exit "${PIPESTATUS[0]}"
+fi
+
 echo "=========================================="
 echo "TRANSCODER INTEL GPU"
 echo "=========================================="

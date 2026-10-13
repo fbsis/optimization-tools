@@ -1,0 +1,947 @@
+#!/usr/bin/env python3
+"""opt-tui - interface de terminal para videoopt, imgopt e filler.
+
+Roda dentro do próprio terminal (tela alternativa, como htop/vim).
+Os motores (videoopt/imgopt) continuam sendo scripts bash que emitem
+eventos JSON lines com --events; esta interface só os dispara e desenha.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    from rich.text import Text
+    from textual import work
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Vertical
+    from textual.screen import ModalScreen, Screen
+    from textual.widgets import (
+        DataTable,
+        Footer,
+        Header,
+        OptionList,
+        ProgressBar,
+        Static,
+    )
+    from textual.widgets.option_list import Option
+except ImportError:  # pragma: no cover
+    print("opt-tui precisa do pacote 'textual' (pipx install textual).", file=sys.stderr)
+    sys.exit(3)
+
+DATA_DIR = Path(os.environ.get("OPT_DATA_DIR", Path.home() / ".local/share/opt"))
+HISTORY_FILE = Path(os.environ.get("OPT_HISTORY", DATA_DIR / "history.tsv"))
+
+VIDEO_EXT = {"mp4", "mkv", "avi", "mov", "m4v", "webm", "mpg", "mpeg", "ts", "mts", "m2ts", "wmv"}
+IMAGE_EXT = {"jpg", "jpeg", "png", "webp"}
+
+BLOCK = 65536
+
+
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+
+def human(n: float) -> str:
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+def hms(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def fingerprint(path: str | os.PathLike, size: int | None = None) -> str:
+    """Mesma impressão digital de optlib.sh (opt_fingerprint)."""
+    if size is None:
+        size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        head = fh.read(BLOCK)
+        fh.seek(size // 2 // BLOCK * BLOCK)
+        mid = fh.read(BLOCK)
+        fh.seek(max(0, size - BLOCK))
+        tail = fh.read(BLOCK)
+    return f"{size}-{hashlib.md5(head + mid + tail).hexdigest()}"
+
+
+def kind_of(name: str) -> str | None:
+    """'video', 'image' ou None (ignorar)."""
+    if name.startswith("."):
+        return None
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext in VIDEO_EXT:
+        if name.lower().endswith("-optimized.mp4"):
+            return None
+        return "video"
+    if ext in IMAGE_EXT:
+        return "image"
+    return None
+
+
+def find_engine(name: str) -> str | None:
+    override = os.environ.get(f"OPT_{name.upper()}")
+    if override:
+        return override
+    here = Path(os.path.realpath(__file__)).parent / name
+    if here.is_file() and os.access(here, os.X_OK):
+        return str(here)
+    return shutil.which(name)
+
+
+# ---------------------------------------------------------------------------
+# Histórico (arquivo texto TSV)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Entry:
+    fp: str
+    kind: str
+    status: str
+    orig: int
+    new: int
+    date: str
+    tool: str
+    param: str
+
+
+class History:
+    def __init__(self, path: Path = HISTORY_FILE):
+        self.path = path
+        self._mtime: float | None = None
+        self.entries: list[Entry] = []
+        self.fps: set[str] = set()
+
+    def refresh(self) -> None:
+        try:
+            mtime = self.path.stat().st_mtime_ns
+        except OSError:
+            self.entries, self.fps, self._mtime = [], set(), None
+            return
+        if mtime == self._mtime:
+            return
+        entries = []
+        with open(self.path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 7:
+                    continue
+                parts += [""] * (8 - len(parts))
+                try:
+                    entries.append(
+                        Entry(parts[0], parts[1], parts[2], int(parts[3] or 0),
+                              int(parts[4] or 0), parts[5], parts[6], parts[7])
+                    )
+                except ValueError:
+                    continue
+        self.entries = entries
+        self.fps = {e.fp for e in entries}
+        self._mtime = mtime
+
+    def has(self, fp: str) -> bool:
+        return fp in self.fps
+
+
+# ---------------------------------------------------------------------------
+# Scanner de pastas
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KindStats:
+    n: int = 0
+    size: int = 0
+    done: int = 0
+    pend_size: int = 0
+
+    @property
+    def pending(self) -> int:
+        return self.n - self.done
+
+    def add(self, other: "KindStats") -> None:
+        self.n += other.n
+        self.size += other.size
+        self.done += other.done
+        self.pend_size += other.pend_size
+
+
+@dataclass
+class Stats:
+    video: KindStats = field(default_factory=KindStats)
+    image: KindStats = field(default_factory=KindStats)
+
+    def add(self, other: "Stats") -> None:
+        self.video.add(other.video)
+        self.image.add(other.image)
+
+    @property
+    def files(self) -> int:
+        return self.video.n + self.image.n
+
+
+class Scanner:
+    def __init__(self, history: History):
+        self.history = history
+        self._cache: dict[tuple[str, int, int], str] = {}
+        self._lock = threading.Lock()
+
+    def _fp(self, path: str, st: os.stat_result) -> str | None:
+        key = (path, st.st_size, st.st_mtime_ns)
+        with self._lock:
+            cached = self._cache.get(key)
+        if cached:
+            return cached
+        try:
+            fp = fingerprint(path, st.st_size)
+        except OSError:
+            return None
+        with self._lock:
+            self._cache[key] = fp
+        return fp
+
+    def scan(self, root: str, recursive: bool = True, cancel=None) -> Stats:
+        stats = Stats()
+        stack = [root]
+        while stack:
+            if cancel and cancel():
+                break
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if recursive and not entry.name.startswith("."):
+                            stack.append(entry.path)
+                        continue
+                    kind = kind_of(entry.name)
+                    if kind is None or not entry.is_file(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                ks = stats.video if kind == "video" else stats.image
+                ks.n += 1
+                ks.size += st.st_size
+                fp = self._fp(entry.path, st)
+                if fp and self.history.has(fp):
+                    ks.done += 1
+                else:
+                    ks.pend_size += st.st_size
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# Modal de confirmação
+# ---------------------------------------------------------------------------
+
+class Confirm(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("enter", "yes", "Sim"),
+        Binding("s", "yes", "Sim", show=False),
+        Binding("y", "yes", "Sim", show=False),
+        Binding("n", "no", "Não"),
+        Binding("escape", "no", "Não", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    Confirm { align: center middle; }
+    Confirm > Vertical {
+        width: 70; height: auto; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    """
+
+    def __init__(self, text: str):
+        super().__init__()
+        self.text = text
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(self.text)
+            yield Static("\n[b]Enter[/b]/[b]S[/b] confirma   [b]N[/b]/[b]Esc[/b] cancela")
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+
+# ---------------------------------------------------------------------------
+# Navegador de pastas
+# ---------------------------------------------------------------------------
+
+class BrowserScreen(Screen):
+    BINDINGS = [
+        Binding("backspace,left", "up", "Subir"),
+        Binding("space", "mark", "Marcar"),
+        Binding("a", "mark_all", "Marcar tudo"),
+        Binding("o", "optimize", "Otimizar"),
+        Binding("v", "toggle_video", "Vídeos"),
+        Binding("i", "toggle_image", "Imagens"),
+        Binding("m", "toggle_mode", "Modo"),
+        Binding("f", "toggle_force", "Forçar"),
+        Binding("F", "filler", "Filler", show=False),
+        Binding("r", "rescan", "Reescanear"),
+        Binding("escape,q", "back", "Menu"),
+    ]
+
+    DEFAULT_CSS = """
+    #path { padding: 0 1; text-style: bold; }
+    #summary { padding: 0 1; color: $text-muted; }
+    #options { padding: 0 1; color: $accent; }
+    BrowserScreen DataTable { height: 1fr; }
+    """
+
+    def __init__(self, start: Path):
+        super().__init__()
+        self.cwd = start
+        self.marked: set[str] = set()
+        self.stats: dict[str, Stats] = {}
+        self.dirs: list[str] = []
+        self.gen = 0
+        self.videos = True
+        self.images = True
+        self.copy_mode = False
+        self.force = False
+        self._resumed = False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(id="path")
+        yield Static(id="options")
+        yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+        yield Static(id="summary")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.add_columns("", "Pasta", "Arquivos", "Vídeos", "Imagens", "Otimizados", "Pendente")
+        self.title = "opt · otimizar mídia"
+        self.load()
+
+    def on_screen_resume(self) -> None:
+        if self._resumed:
+            self.rescan()
+        self._resumed = True
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.action_open()
+
+    # -- dados ---------------------------------------------------------
+
+    def load(self) -> None:
+        self.gen += 1
+        self.stats = {}
+        try:
+            self.dirs = sorted(
+                (e.name for e in os.scandir(self.cwd)
+                 if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")),
+                key=str.lower,
+            )
+        except OSError:
+            self.dirs = []
+        self.render_table()
+        self.update_header()
+        self.scan_worker(self.gen)
+
+    def rescan(self) -> None:
+        self.app.history.refresh()
+        self.load()
+
+    @work(thread=True, group="scan")
+    def scan_worker(self, gen: int) -> None:
+        app: OptApp = self.app  # type: ignore[assignment]
+        scanner = app.scanner
+        cancelled = lambda: gen != self.gen  # noqa: E731
+
+        for name in list(self.dirs):
+            if cancelled():
+                return
+            st = scanner.scan(str(self.cwd / name), cancel=cancelled)
+            if cancelled():
+                return
+            self.app.call_from_thread(self.set_stats, gen, name, st)
+
+        here = scanner.scan(str(self.cwd), recursive=False, cancel=cancelled)
+        if not cancelled():
+            self.app.call_from_thread(self.set_here, gen, here)
+
+    def set_stats(self, gen: int, name: str, st: Stats) -> None:
+        if gen != self.gen:
+            return
+        self.stats[name] = st
+        self.refresh_row(name)
+        self.update_summary()
+
+    def set_here(self, gen: int, st: Stats) -> None:
+        if gen != self.gen:
+            return
+        self.stats["."] = st
+        self.update_summary()
+
+    # -- desenho -------------------------------------------------------
+
+    def kinds_text(self) -> str:
+        parts = []
+        parts.append("[b]vídeos[/b]" if self.videos else "[dim]vídeos[/dim]")
+        parts.append("[b]imagens[/b]" if self.images else "[dim]imagens[/dim]")
+        mode = "criar cópia" if self.copy_mode else "substituir originais"
+        force = "  ·  [b]ignorar histórico[/b]" if self.force else ""
+        return (f"Tipos: {' + '.join(parts)}  ·  Modo: [b]{mode}[/b]{force}"
+                "  ·  [dim]Enter entra na pasta[/dim]")
+
+    def update_header(self) -> None:
+        self.query_one("#path", Static).update(f"📁 {self.cwd}")
+        self.query_one("#options", Static).update(self.kinds_text())
+
+    def row_cells(self, name: str) -> list:
+        mark = Text("●", style="bold green") if str(self.cwd / name) in self.marked else Text(" ")
+        st = self.stats.get(name)
+        if st is None:
+            return [mark, f"{name}/", "…", "…", "…", "…", "…"]
+
+        def kind_cell(ks: KindStats) -> str:
+            return f"{ks.n} · {human(ks.size)}" if ks.n else "–"
+
+        done = (st.video.done if self.videos else 0) + (st.image.done if self.images else 0)
+        total = (st.video.n if self.videos else 0) + (st.image.n if self.images else 0)
+        pend_n = (st.video.pending if self.videos else 0) + (st.image.pending if self.images else 0)
+        pend_b = (st.video.pend_size if self.videos else 0) + (st.image.pend_size if self.images else 0)
+        pending = (
+            Text(f"{pend_n} · {human(pend_b)}", style="yellow") if pend_n
+            else Text("✓ nada", style="green") if total else Text("–")
+        )
+        return [mark, f"{name}/", str(st.files), kind_cell(st.video), kind_cell(st.image),
+                f"{done}/{total}" if total else "–", pending]
+
+    def render_table(self) -> None:
+        table = self.query_one(DataTable)
+        table.clear()
+        if self.cwd.parent != self.cwd:
+            table.add_row("", "../", "", "", "", "", "", key="..")
+        for name in self.dirs:
+            table.add_row(*self.row_cells(name), key=name)
+
+    def refresh_row(self, name: str) -> None:
+        table = self.query_one(DataTable)
+        try:
+            for col, value in zip(table.ordered_columns, self.row_cells(name)):
+                table.update_cell(name, col.key, value)
+        except Exception:
+            pass
+
+    def refresh_all_rows(self) -> None:
+        for name in self.dirs:
+            self.refresh_row(name)
+        self.update_summary()
+
+    def update_summary(self) -> None:
+        total = Stats()
+        for st in self.stats.values():
+            total.add(st)
+        scanned = len([k for k in self.stats if k != "."])
+        waiting = "" if scanned >= len(self.dirs) and "." in self.stats else "  (escaneando…)"
+        v, i = total.video, total.image
+        text = (
+            f"Total aqui: {total.files} arquivos · "
+            f"vídeos {v.n} ({human(v.size)}) · imagens {i.n} ({human(i.size)})  |  "
+            f"pendente: vídeos {v.pending} ({human(v.pend_size)}) · "
+            f"imagens {i.pending} ({human(i.pend_size)}){waiting}"
+        )
+        self.query_one("#summary", Static).update(text)
+
+    # -- ações ---------------------------------------------------------
+
+    def current_key(self) -> str | None:
+        table = self.query_one(DataTable)
+        if table.row_count == 0:
+            return None
+        try:
+            return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            return None
+
+    def action_open(self) -> None:
+        key = self.current_key()
+        if key == "..":
+            self.action_up()
+        elif key:
+            self.cwd = self.cwd / key
+            self.load()
+
+    def action_up(self) -> None:
+        if self.cwd.parent != self.cwd:
+            previous = self.cwd.name
+            self.cwd = self.cwd.parent
+            self.load()
+            table = self.query_one(DataTable)
+            if previous in self.dirs:
+                table.move_cursor(row=self.dirs.index(previous) + (1 if self.cwd.parent != self.cwd else 0))
+
+    def action_mark(self) -> None:
+        key = self.current_key()
+        if not key or key == "..":
+            return
+        path = str(self.cwd / key)
+        self.marked.symmetric_difference_update({path})
+        self.refresh_row(key)
+
+    def action_mark_all(self) -> None:
+        paths = {str(self.cwd / n) for n in self.dirs}
+        if paths <= self.marked:
+            self.marked -= paths
+        else:
+            self.marked |= paths
+        self.refresh_all_rows()
+
+    def action_toggle_video(self) -> None:
+        self.videos = not self.videos
+        self.update_header()
+        self.refresh_all_rows()
+
+    def action_toggle_image(self) -> None:
+        self.images = not self.images
+        self.update_header()
+        self.refresh_all_rows()
+
+    def action_toggle_mode(self) -> None:
+        self.copy_mode = not self.copy_mode
+        self.update_header()
+
+    def action_toggle_force(self) -> None:
+        self.force = not self.force
+        self.update_header()
+
+    def action_rescan(self) -> None:
+        self.rescan()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_filler(self) -> None:
+        self.app.run_filler(self.cwd)
+
+    def action_optimize(self) -> None:
+        if not (self.videos or self.images):
+            self.notify("Selecione vídeos e/ou imagens (v / i).", severity="warning")
+            return
+        paths = sorted(self.marked) or [str(self.cwd)]
+        what = " + ".join(
+            n for n, on in (("vídeos", self.videos), ("imagens", self.images)) if on
+        )
+        mode = "CRIAR CÓPIA" if self.copy_mode else "SUBSTITUIR os originais"
+        listing = "\n".join(f"  • {p}" for p in paths[:8])
+        if len(paths) > 8:
+            listing += f"\n  … +{len(paths) - 8}"
+        text = f"[b]Otimizar {what}[/b]\nModo: {mode}\n\n{listing}"
+
+        def after(ok: bool | None) -> None:
+            if ok:
+                self.app.push_screen(
+                    RunScreen(paths, self.videos, self.images, self.copy_mode, self.force)
+                )
+
+        self.app.push_screen(Confirm(text), after)
+
+
+# ---------------------------------------------------------------------------
+# Execução
+# ---------------------------------------------------------------------------
+
+STAGE_LABEL = {"upload": "Enviando ao transcoder", "convert": "Convertendo (GPU)",
+               "download": "Recebendo resultado"}
+STAGE_RANGE = {"upload": (0.0, 0.2), "convert": (0.2, 0.8), "download": (0.8, 1.0)}
+
+
+class RunScreen(Screen):
+    BINDINGS = [
+        Binding("c", "cancel", "Cancelar"),
+        Binding("escape,enter", "back", "Voltar"),
+    ]
+
+    DEFAULT_CSS = """
+    RunScreen Vertical#box { padding: 0 1; height: auto; }
+    RunScreen .lbl { color: $text-muted; margin-top: 1; }
+    RunScreen #current { text-style: bold; }
+    RunScreen DataTable { height: 1fr; margin-top: 1; }
+    """
+
+    def __init__(self, paths: list[str], videos: bool, images: bool,
+                 copy_mode: bool, force: bool):
+        super().__init__()
+        self.paths = paths
+        self.videos = videos
+        self.images = images
+        self.copy_mode = copy_mode
+        self.force = force
+        self.proc: asyncio.subprocess.Process | None = None
+        self.cancelled = False
+        self.finished = False
+        self.started = time.time()
+        self.ok = self.skipped = self.failed = 0
+        self.saved = 0
+        self.base = (0, 0, 0, 0)
+        self.row_n = 0
+        self.step_label = ""
+        self.stage_frac = 0.0
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="box"):
+            yield Static("Preparando…", id="title")
+            yield Static("Geral", classes="lbl")
+            yield ProgressBar(total=100, show_eta=False, id="overall")
+            yield Static("", id="stage", classes="lbl")
+            yield ProgressBar(total=100, show_eta=False, id="stagebar")
+            yield Static("", id="current")
+            yield Static("", id="totals")
+        yield DataTable(id="results", cursor_type="row", zebra_stripes=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = "opt · executando"
+        table = self.query_one("#results", DataTable)
+        table.add_columns("", "Arquivo", "Original", "Novo", "Economia", "Obs.")
+        table.can_focus = False
+        self.set_interval(1, self.tick)
+        self.run_all()
+
+    # -- helpers de UI -------------------------------------------------
+
+    def tick(self) -> None:
+        if not self.finished:
+            self.update_totals()
+
+    def update_totals(self) -> None:
+        elapsed = hms(time.time() - self.started)
+        self.query_one("#totals", Static).update(
+            f"[green]✓ {self.ok}[/green]   [yellow]⊘ {self.skipped}[/yellow]   "
+            f"[red]✗ {self.failed}[/red]   ·   economia [b]{human(self.saved)}[/b]   ·   {elapsed}"
+        )
+
+    def set_overall(self, frac: float) -> None:
+        self.query_one("#overall", ProgressBar).update(total=1000, progress=int(frac * 1000))
+
+    def set_stage(self, name: str, pct: int) -> None:
+        self.query_one("#stage", Static).update(f"{self.step_label} · {STAGE_LABEL.get(name, name)}")
+        self.query_one("#stagebar", ProgressBar).update(total=100, progress=pct)
+
+    # -- motores -------------------------------------------------------
+
+    @work(exclusive=True)
+    async def run_all(self) -> None:
+        steps: list[tuple[str, str, list[str]]] = []
+        for label, wanted, engine in (("Vídeos", self.videos, "videoopt"),
+                                      ("Imagens", self.images, "imgopt")):
+            if not wanted:
+                continue
+            exe = find_engine(engine)
+            if not exe:
+                self.query_one("#title", Static).update(f"[red]{engine} não encontrado[/red]")
+                self.notify(f"{engine} não encontrado no PATH.", severity="error")
+                continue
+            mode = ("optimized" if engine == "videoopt" else "parallel") if self.copy_mode else "replace"
+            args = [exe, "--events", "--yes", "--mode", mode]
+            if self.force:
+                args.append("--force")
+            steps.append((label, engine, args + self.paths))
+
+        for index, (label, engine, argv) in enumerate(steps):
+            if self.cancelled:
+                break
+            self.step_label = label
+            self.base = (self.ok, self.skipped, self.failed, self.saved)
+            self.row_n = 0
+            self.query_one("#title", Static).update(
+                f"[b]{label}[/b]  (etapa {index + 1}/{len(steps)})"
+            )
+            await self.run_engine(engine, argv)
+
+        self.finished = True
+        self.update_totals()
+        self.set_overall(1.0 if not self.cancelled else 0)
+        status = "[yellow]Cancelado.[/yellow]" if self.cancelled else "[green]Concluído.[/green]"
+        self.query_one("#title", Static).update(f"{status}  Pressione Enter ou Esc para voltar.")
+        self.query_one("#stage", Static).update("")
+        self.title = "opt · concluído"
+        self.app.history.refresh()
+
+    async def run_engine(self, engine: str, argv: list[str]) -> None:
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+                limit=1 << 20,
+            )
+        except OSError as exc:
+            self.notify(f"Falha ao iniciar {engine}: {exc}", severity="error")
+            return
+
+        assert self.proc.stdout is not None
+        total = 0
+        while True:
+            raw = await self.proc.stdout.readline()
+            if not raw:
+                break
+            try:
+                ev = json.loads(raw.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                continue
+            total = self.handle(engine, ev, total)
+        rc = await self.proc.wait()
+        if rc not in (0, 130) and not self.cancelled:
+            self.notify(f"{engine} terminou com código {rc}", severity="warning")
+        self.proc = None
+
+    def handle(self, engine: str, ev: dict, total: int) -> int:
+        kind = ev.get("ev")
+        cur = self.query_one("#current", Static)
+
+        if kind == "scan" and "todo" in ev:
+            cur.update(
+                f"{ev.get('todo', 0)} a processar · {ev.get('history', 0)} já otimizados "
+                f"(histórico) · {ev.get('efficient', 0)} já eficientes"
+            )
+        elif kind == "start":
+            total = int(ev.get("total", 0))
+        elif kind == "file":
+            total = int(ev.get("total", total))
+            cur.update(f"{ev.get('i', '?')}/{total}  {ev.get('name', '')}  ({human(ev.get('size', 0))})")
+            self.stage_frac = 0.0
+            self.query_one("#stagebar", ProgressBar).update(total=100, progress=0)
+        elif kind == "stage":
+            name = ev.get("stage", "")
+            pct = int(ev.get("pct", 0))
+            self.set_stage(name, pct)
+            lo, hi = STAGE_RANGE.get(name, (0, 1))
+            self.stage_frac = lo + (hi - lo) * pct / 100
+            if total:
+                self.set_overall((self.row_n + self.stage_frac) / total)
+        elif kind == "result":
+            self.row_n += 1
+            status = ev.get("status", "")
+            table = self.query_one("#results", DataTable)
+            symbol = {"ok": Text("✓", style="green"), "skip": Text("⊘", style="yellow"),
+                      "fail": Text("✗", style="red")}.get(status, Text("?"))
+            saved = int(ev.get("saved", 0))
+            table.add_row(
+                symbol, ev.get("name", ""), human(ev.get("orig", 0)),
+                human(ev.get("new", 0)) if ev.get("new") else "–",
+                human(saved) if saved else "–", ev.get("msg", ""),
+            )
+            table.move_cursor(row=table.row_count - 1)
+            if status == "ok":
+                self.ok += 1
+                self.saved += saved
+            elif status == "skip":
+                self.skipped += 1
+            elif status == "fail":
+                self.failed += 1
+            if total:
+                self.set_overall(self.row_n / total)
+            self.update_totals()
+        elif kind == "progress":  # imgopt
+            done, tot = int(ev.get("done", 0)), max(int(ev.get("total", 1)), 1)
+            self.set_overall(done / tot)
+            b_ok, b_skip, b_fail, b_saved = self.base
+            self.ok = b_ok + int(ev.get("ok", 0))
+            self.skipped = b_skip + int(ev.get("skipped", 0)) + int(ev.get("history", 0))
+            self.failed = b_fail + int(ev.get("failed", 0))
+            self.saved = b_saved + int(ev.get("saved", 0))
+            cur.update(
+                f"{done}/{tot} imagens · {ev.get('history', 0)} já otimizadas (histórico)"
+            )
+            self.query_one("#stage", Static).update(f"{self.step_label} · processando em paralelo")
+            self.query_one("#stagebar", ProgressBar).update(total=100, progress=int(done * 100 / tot))
+            self.update_totals()
+        elif kind == "error":
+            self.notify(ev.get("msg", "erro"), severity="error", timeout=10)
+            cur.update(f"[red]{ev.get('msg', 'erro')}[/red]")
+        elif kind == "warn":
+            self.notify(ev.get("msg", ""), severity="warning")
+        elif kind == "end":
+            self.update_totals()
+        return total
+
+    # -- ações ---------------------------------------------------------
+
+    def action_cancel(self) -> None:
+        if self.finished or self.cancelled:
+            return
+        self.cancelled = True
+        self.query_one("#title", Static).update("[yellow]Cancelando e limpando o job remoto…[/yellow]")
+        self.terminate()
+
+    @work(exclusive=False)
+    async def terminate(self) -> None:
+        proc = self.proc
+        if not proc:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def action_back(self) -> None:
+        if not self.finished:
+            self.notify("Em execução. Use [b]c[/b] para cancelar.", severity="warning")
+            return
+        self.app.pop_screen()
+
+
+# ---------------------------------------------------------------------------
+# Histórico
+# ---------------------------------------------------------------------------
+
+class HistoryScreen(Screen):
+    BINDINGS = [Binding("escape,q", "back", "Menu")]
+
+    DEFAULT_CSS = """
+    #hsummary { padding: 0 1; text-style: bold; }
+    HistoryScreen DataTable { height: 1fr; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(id="hsummary")
+        yield DataTable(cursor_type="row", zebra_stripes=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = "opt · histórico"
+        history: History = self.app.history
+        history.refresh()
+        entries = history.entries
+        table = self.query_one(DataTable)
+        table.add_columns("Data", "Tipo", "Status", "Original", "Novo", "Economia", "Ferramenta")
+        for e in reversed(entries[-1000:]):
+            saved = max(e.orig - e.new, 0) if e.status == "ok" else 0
+            table.add_row(e.date.replace("T", " "), e.kind, e.status, human(e.orig),
+                          human(e.new), human(saved) if saved else "–", e.tool)
+        ok = [e for e in entries if e.status == "ok"]
+        saved = sum(max(e.orig - e.new, 0) for e in ok)
+        self.query_one("#hsummary", Static).update(
+            f"{len(entries)} registros · {len(ok)} otimizados · economia total {human(saved)} · {HISTORY_FILE}"
+        )
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+# ---------------------------------------------------------------------------
+# App / menu
+# ---------------------------------------------------------------------------
+
+class OptApp(App):
+    TITLE = "opt"
+    CSS = """
+    #menu { width: 64; height: auto; margin: 2 4; border: round $primary; padding: 1 2; }
+    #banner { padding: 1 4 0 4; text-style: bold; color: $accent; }
+    #hint { padding: 0 4; color: $text-muted; }
+    """
+    BINDINGS = [Binding("ctrl+q", "quit", "Sair", show=False)]
+
+    def __init__(self, start: Path):
+        super().__init__()
+        self.start = start
+        self.history = History()
+        self.history.refresh()
+        self.scanner = Scanner(self.history)
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("OPT · otimização de mídia", id="banner")
+        yield OptionList(
+            Option("🎬  Navegar pastas e otimizar        [dim]vídeos + imagens[/dim]", id="browse"),
+            Option(f"⚡  Otimizar a pasta atual            [dim]{self.start.name or '/'}[/dim]", id="here"),
+            Option("🕘  Histórico                        [dim]o que já foi feito[/dim]", id="history"),
+            Option("📦  Filler                           [dim]mover p/ VeraCrypt[/dim]", id="filler"),
+            Option("✖   Sair", id="quit"),
+            id="menu",
+        )
+        yield Static("↑↓ escolhe · Enter abre · q sai", id="hint")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one(OptionList).focus()
+
+    def on_key(self, event) -> None:
+        if event.key == "q" and len(self.screen_stack) == 1:
+            self.exit()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        choice = event.option.id
+        if choice == "browse":
+            self.push_screen(BrowserScreen(self.start))
+        elif choice == "here":
+            text = (f"[b]Otimizar vídeos + imagens[/b]\nModo: SUBSTITUIR os originais\n\n"
+                    f"  • {self.start}")
+
+            def after(ok: bool | None) -> None:
+                if ok:
+                    self.push_screen(RunScreen([str(self.start)], True, True, False, False))
+
+            self.push_screen(Confirm(text), after)
+        elif choice == "history":
+            self.push_screen(HistoryScreen())
+        elif choice == "filler":
+            self.run_filler(self.start)
+        else:
+            self.exit()
+
+    def run_filler(self, folder: Path) -> None:
+        exe = find_engine("filler")
+        if not exe:
+            self.notify("filler não encontrado no PATH.", severity="error")
+            return
+        with self.suspend():
+            subprocess.run(["clear"], check=False)
+            subprocess.run([exe], cwd=folder, check=False)
+            try:
+                input("\nEnter para voltar ao opt… ")
+            except (EOFError, KeyboardInterrupt):
+                pass
+
+
+def main() -> int:
+    start = Path(os.environ.get("OPT_TUI_CWD", os.getcwd())).resolve()
+    if len(sys.argv) > 1 and Path(sys.argv[1]).is_dir():
+        start = Path(sys.argv[1]).resolve()
+    OptApp(start).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

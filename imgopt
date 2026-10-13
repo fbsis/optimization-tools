@@ -2,11 +2,21 @@
 
 set -uo pipefail
 
-SOURCE="$(pwd)"
-SOURCE_NAME="$(basename "$SOURCE")"
-SOURCE_PARENT="$(dirname "$SOURCE")"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 
-PARALLEL_DEST="${SOURCE_PARENT}/${SOURCE_NAME}-optimized"
+for OPTLIB in "${SCRIPT_DIR}/optlib.sh" /usr/local/lib/opt/optlib.sh; do
+    if [[ -f "$OPTLIB" ]]; then
+        # shellcheck disable=SC1090
+        source "$OPTLIB"
+        break
+    fi
+done
+
+if ! declare -F opt_emit >/dev/null; then
+    echo "ERRO: optlib.sh não encontrado."
+    echo "Instale com: sudo install -D -m 0644 optlib.sh /usr/local/lib/opt/optlib.sh"
+    exit 1
+fi
 
 JPEG_QUALITY=82
 WEBP_QUALITY=82
@@ -21,7 +31,93 @@ RUN_ID="$(date '+%Y%m%d-%H%M%S')"
 LOG_FILE="${LOG_DIR}/imgopt-${RUN_ID}.log"
 STATUS_DIR="/tmp/imgopt-${RUN_ID}"
 
+MODE=""
+ASSUME_YES=0
+PATH_ARGS=()
+
+show_help() {
+    cat <<'EOF'
+
+Uso: imgopt [opções] [pasta ...]
+
+  Sem argumentos processa a pasta atual (recursivo).
+
+Opções:
+  --mode replace|parallel   Substituir originais (padrão) ou criar <pasta>-optimized
+  --jobs N                  Número de workers
+  -y, --yes                 Não perguntar nada (usa o padrão)
+  --force                   Ignorar o histórico e reprocessar
+  --events                  Saída em JSON lines (usado pela TUI)
+  -h, --help                Esta ajuda
+
+EOF
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+        --events)
+            OPT_EVENTS=1
+            export OPT_EVENTS
+            ;;
+        --force)
+            OPT_FORCE=1
+            export OPT_FORCE
+            ;;
+        -y|--yes)
+            ASSUME_YES=1
+            ;;
+        --mode)
+            MODE="${2:-}"
+            shift
+            ;;
+        --mode=*)
+            MODE="${1#--mode=}"
+            ;;
+        --jobs)
+            JOBS="${2:-}"
+            shift
+            ;;
+        --jobs=*)
+            JOBS="${1#--jobs=}"
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --)
+            shift
+            PATH_ARGS+=("$@")
+            break
+            ;;
+        *)
+            PATH_ARGS+=("$1")
+            ;;
+    esac
+
+    shift
+done
+
+case "$MODE" in
+    ""|replace|parallel)
+        ;;
+    *)
+        echo "Modo inválido: $MODE (use replace ou parallel)"
+        exit 1
+        ;;
+esac
+
+if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || (( JOBS < 1 )); then
+    echo "Número de workers inválido: $JOBS"
+    exit 1
+fi
+
+if [[ "$OPT_EVENTS" == "1" ]]; then
+    ASSUME_YES=1
+fi
+
 mkdir -p "$LOG_DIR" "$STATUS_DIR"
+
+opt_events_init "$LOG_FILE"
 
 if command -v magick >/dev/null 2>&1; then
     IMG_CMD="magick"
@@ -32,6 +128,9 @@ else
     echo
     echo "Instale com:"
     echo "  apt install -y imagemagick"
+
+    opt_emit ev=error msg="ImageMagick não está instalado"
+
     exit 1
 fi
 
@@ -49,14 +148,16 @@ trap cleanup EXIT
 
 optimize_file() {
     local src="$1"
-    local source="$2"
-    local dest="$3"
-    local mode="$4"
-    local jpeg_quality="$5"
-    local webp_quality="$6"
-    local status_dir="$7"
-    local log_file="$8"
+    local sources="$2"
+    local mode="$3"
+    local jpeg_quality="$4"
+    local webp_quality="$5"
+    local status_dir="$6"
+    local log_file="$7"
 
+    local source=""
+    local dest
+    local candidate
     local rel
     local target
     local target_dir
@@ -65,6 +166,7 @@ optimize_file() {
     local src_size
     local new_size
     local status_file
+    local src_fp
 
     status_file="${status_dir}/${BASHPID}-$(date +%s%N)"
 
@@ -72,6 +174,17 @@ optimize_file() {
         echo "FAIL|0|0" > "$status_file"
         return 0
     fi
+
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" && "$src" == "$candidate"/* ]] || continue
+
+        # a origem mais específica (mais longa) vence
+        (( ${#candidate} > ${#source} )) && source="$candidate"
+    done <<< "$sources"
+
+    [[ -n "$source" ]] || source="$(dirname "$src")"
+
+    dest="${source}-optimized"
 
     rel="${src#"$source"/}"
 
@@ -86,10 +199,17 @@ optimize_file() {
     ext="${src##*.}"
     ext="${ext,,}"
 
-    src_size="$(stat -c '%s' "$src" 2>/dev/null)" || {
+    src_size="$(opt_file_size "$src")" || {
         echo "FAIL|0|0" > "$status_file"
         return 0
     }
+
+    src_fp="$(opt_fingerprint "$src")"
+
+    if [[ "$mode" != "parallel" && "${OPT_FORCE:-0}" != "1" ]] && opt_history_has "$src_fp"; then
+        echo "HIST|$src_size|$src_size" > "$status_file"
+        return 0
+    fi
 
     temp="$(mktemp --suffix=".${ext}")"
 
@@ -148,7 +268,7 @@ optimize_file() {
         return 0
     fi
 
-    new_size="$(stat -c '%s' "$temp" 2>/dev/null || echo 0)"
+    new_size="$(opt_file_size "$temp" || echo 0)"
 
     if (( new_size <= 0 )); then
         rm -f "$temp"
@@ -167,6 +287,9 @@ optimize_file() {
                 return 0
             fi
         fi
+
+        opt_history_add "$src_fp" image skip-larger \
+            "$src_size" "$new_size" imgopt "q${jpeg_quality}/${webp_quality}"
 
         echo "SKIP|$src_size|$src_size" > "$status_file"
 
@@ -201,6 +324,14 @@ optimize_file() {
         fi
     fi
 
+    opt_history_add "$(opt_fingerprint "$target")" image ok \
+        "$src_size" "$new_size" imgopt "q${jpeg_quality}/${webp_quality}"
+
+    if [[ "$mode" == "parallel" ]]; then
+        opt_history_add "$src_fp" image ok \
+            "$src_size" "$new_size" imgopt "q${jpeg_quality}/${webp_quality}"
+    fi
+
     echo "OK|$src_size|$new_size" > "$status_file"
 
     printf '[%s] OK: %s | %s -> %s\n' \
@@ -214,89 +345,9 @@ optimize_file() {
 
 export -f optimize_file
 
-clear
 
-echo "=========================================="
-echo "            IMGOPT PARALLEL"
-echo "=========================================="
-echo
-echo "Origem:"
-echo "  $SOURCE"
-echo
-echo "CPU:"
-echo "  $CPU_COUNT cores"
-echo
-echo "Workers sugeridos:"
-echo "  $JOBS"
-echo
-echo "  [1] Criar diretório paralelo:"
-echo "      $PARALLEL_DEST"
-echo
-echo "  [2] Substituir arquivos originais"
-echo
-echo "  [3] Cancelar"
-echo
-
-while true; do
-    read -r -p "Escolha [1/2/3]: " CHOICE
-
-    case "$CHOICE" in
-        1)
-            MODE="parallel"
-            DEST="$PARALLEL_DEST"
-            break
-            ;;
-        2)
-            MODE="replace"
-            DEST="$SOURCE"
-            break
-            ;;
-        3)
-            exit 0
-            ;;
-        *)
-            echo "Escolha 1, 2 ou 3."
-            ;;
-    esac
-done
-
-echo
-read -r -p "Quantos workers? [$JOBS]: " CUSTOM_JOBS
-
-if [[ -n "$CUSTOM_JOBS" ]]; then
-    if [[ "$CUSTOM_JOBS" =~ ^[0-9]+$ ]] &&
-       (( CUSTOM_JOBS > 0 )); then
-
-        JOBS="$CUSTOM_JOBS"
-    else
-        echo "Número inválido."
-        exit 1
-    fi
-fi
-
-echo
-read -r -p "Confirmar? [s/n]: " CONFIRM
-
-case "${CONFIRM,,}" in
-    s|sim|y|yes)
-        ;;
-    *)
-        echo "Cancelado."
-        exit 0
-        ;;
-esac
-
-if [[ "$MODE" == "parallel" ]]; then
-    mkdir -p "$DEST"
-fi
-
-touch "$LOG_FILE"
-
-echo
-echo "Contando imagens..."
-
-TOTAL_FILES="$(
-    find "$SOURCE" \
+find_images() {
+    find "$1" \
         -type f \
         \( \
             -iname '*.jpg' \
@@ -304,80 +355,231 @@ TOTAL_FILES="$(
             -o -iname '*.png' \
             -o -iname '*.webp' \
         \) \
-        -printf '.' |
-    wc -c
-)"
+        -print0
+}
+
+is_image() {
+    case "${1,,}" in
+        *.jpg|*.jpeg|*.png|*.webp)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+if (( ${#PATH_ARGS[@]} == 0 )); then
+    PATH_ARGS=("$(pwd)")
+fi
+
+LIST_FILE="${STATUS_DIR}.list"
+SOURCES=""
+
+: > "$LIST_FILE"
+
+for ARG in "${PATH_ARGS[@]}"; do
+    if [[ -d "$ARG" ]]; then
+        ABS="$(cd "$ARG" && pwd)"
+        SOURCES+="${ABS}"$'\n'
+        find_images "$ABS" >> "$LIST_FILE"
+    elif [[ -f "$ARG" ]] && is_image "$ARG"; then
+        ABS="$(cd "$(dirname "$ARG")" && pwd)/$(basename "$ARG")"
+        SOURCES+="$(dirname "$ABS")"$'\n'
+        printf '%s\0' "$ABS" >> "$LIST_FILE"
+    else
+        echo "Ignorado (não é pasta nem imagem): $ARG"
+        opt_emit ev=warn msg="Ignorado: $ARG"
+    fi
+done
+
+SOURCES="${SOURCES%$'\n'}"
+
+TOTAL_FILES="$(tr -cd '\0' < "$LIST_FILE" | wc -c | tr -d ' ')"
+
+cleanup() {
+    rm -rf "$STATUS_DIR" "$LIST_FILE"
+}
+
+trap cleanup EXIT
 
 if (( TOTAL_FILES == 0 )); then
     echo
     echo "Nenhuma imagem encontrada."
+
+    opt_emit ev=scan found#=0 todo#=0
+    opt_emit ev=end status=empty ok#=0 skipped#=0 failed#=0 saved#=0 log="$LOG_FILE"
+
     exit 0
 fi
+
+opt_emit ev=scan found#="$TOTAL_FILES"
+
+if (( ASSUME_YES == 0 )); then
+    clear
+
+    echo "=========================================="
+    echo "            IMGOPT PARALLEL"
+    echo "=========================================="
+    echo
+    echo "Origem:"
+    printf '  %s\n' "${PATH_ARGS[@]}"
+    echo
+    echo "Imagens encontradas:"
+    echo "  $TOTAL_FILES"
+    echo
+    echo "CPU:"
+    echo "  $CPU_COUNT cores"
+    echo
+    echo "Workers sugeridos:"
+    echo "  $JOBS"
+    echo
+fi
+
+if [[ -z "$MODE" ]]; then
+    if (( ASSUME_YES == 1 )); then
+        MODE="replace"
+    else
+        echo "  [1] Criar diretório paralelo (<pasta>-optimized)"
+        echo
+        echo "  [2] Substituir arquivos originais (padrão)"
+        echo
+        echo "  [3] Cancelar"
+        echo
+
+        while true; do
+            read -r -p "Escolha [1/2/3] (Enter=2): " CHOICE
+
+            case "$CHOICE" in
+                1)
+                    MODE="parallel"
+                    break
+                    ;;
+                ""|2)
+                    MODE="replace"
+                    break
+                    ;;
+                3)
+                    exit 0
+                    ;;
+                *)
+                    echo "Escolha 1, 2 ou 3."
+                    ;;
+            esac
+        done
+    fi
+fi
+
+if (( ASSUME_YES == 0 )); then
+    echo
+    read -r -p "Quantos workers? [$JOBS]: " CUSTOM_JOBS
+
+    if [[ -n "$CUSTOM_JOBS" ]]; then
+        if [[ "$CUSTOM_JOBS" =~ ^[0-9]+$ ]] &&
+           (( CUSTOM_JOBS > 0 )); then
+
+            JOBS="$CUSTOM_JOBS"
+        else
+            echo "Número inválido."
+            exit 1
+        fi
+    fi
+
+    echo
+    read -r -p "Confirmar? [S/n]: " CONFIRM
+
+    case "${CONFIRM,,}" in
+        ""|s|sim|y|yes)
+            ;;
+        *)
+            echo "Cancelado."
+            exit 0
+            ;;
+    esac
+fi
+
+touch "$LOG_FILE"
 
 echo
 echo "Encontradas: $TOTAL_FILES imagens"
 echo "Workers:     $JOBS"
 echo
 
+opt_emit ev=start total#="$TOTAL_FILES" mode="$MODE" jobs#="$JOBS"
+
 START_TIME="$(date +%s)"
 
-find "$SOURCE" \
-    -type f \
-    \( \
-        -iname '*.jpg' \
-        -o -iname '*.jpeg' \
-        -o -iname '*.png' \
-        -o -iname '*.webp' \
-    \) \
-    -print0 |
 xargs \
     -0 \
     -P "$JOBS" \
     -n 1 \
     bash -c '
         optimize_file \
-            "$8" \
+            "$7" \
             "$1" \
             "$2" \
             "$3" \
             "$4" \
             "$5" \
-            "$6" \
-            "$7"
+            "$6"
     ' _ \
-    "$SOURCE" \
-    "$DEST" \
+    "$SOURCES" \
     "$MODE" \
     "$JPEG_QUALITY" \
     "$WEBP_QUALITY" \
     "$STATUS_DIR" \
-    "$LOG_FILE" &
+    "$LOG_FILE" < "$LIST_FILE" &
 
 WORK_PID=$!
 
-while kill -0 "$WORK_PID" 2>/dev/null; do
+on_signal() {
+    kill "$WORK_PID" 2>/dev/null
+    pkill -P "$WORK_PID" 2>/dev/null
+
+    opt_emit ev=end status=canceled \
+        ok#="${OPTIMIZED:-0}" skipped#="${SKIPPED:-0}" failed#="${FAILED:-0}" \
+        saved#="${SAVED:-0}" log="$LOG_FILE"
+
+    exit 130
+}
+
+trap on_signal INT TERM
+
+PROCESSED=0
+OPTIMIZED=0
+SKIPPED=0
+HISTORY=0
+FAILED=0
+SAVED=0
+
+collect_status() {
     PROCESSED=0
     OPTIMIZED=0
     SKIPPED=0
+    HISTORY=0
     FAILED=0
-    ORIGINAL_BYTES=0
-    FINAL_BYTES=0
+
+    local original_bytes=0
+    local final_bytes=0
+    local status result old new
 
     shopt -s nullglob
 
-    for STATUS in "$STATUS_DIR"/*; do
-        IFS='|' read -r RESULT OLD NEW < "$STATUS"
+    for status in "$STATUS_DIR"/*; do
+        IFS='|' read -r result old new < "$status" || continue
 
         ((PROCESSED++))
-        ORIGINAL_BYTES=$((ORIGINAL_BYTES + OLD))
-        FINAL_BYTES=$((FINAL_BYTES + NEW))
+        original_bytes=$((original_bytes + old))
+        final_bytes=$((final_bytes + new))
 
-        case "$RESULT" in
+        case "$result" in
             OK)
                 ((OPTIMIZED++))
                 ;;
             SKIP)
                 ((SKIPPED++))
+                ;;
+            HIST)
+                ((HISTORY++))
                 ;;
             FAIL)
                 ((FAILED++))
@@ -387,30 +589,55 @@ while kill -0 "$WORK_PID" 2>/dev/null; do
 
     shopt -u nullglob
 
-    PERCENT=$((PROCESSED * 100 / TOTAL_FILES))
-    SAVED=$((ORIGINAL_BYTES - FINAL_BYTES))
+    SAVED=$((original_bytes - final_bytes))
 
     (( SAVED < 0 )) && SAVED=0
+}
 
-    printf '\r\033[K'
+while kill -0 "$WORK_PID" 2>/dev/null; do
+    collect_status
 
-    printf '[%3d%%] %d/%d | OK: %d | Skip: %d | Erros: %d | Economia: %s | Workers: %d' \
-        "$PERCENT" \
-        "$PROCESSED" \
-        "$TOTAL_FILES" \
-        "$OPTIMIZED" \
-        "$SKIPPED" \
-        "$FAILED" \
-        "$(human_bytes "$SAVED")" \
-        "$JOBS"
+    PERCENT=$((PROCESSED * 100 / TOTAL_FILES))
+
+    if [[ "$OPT_EVENTS" == "1" ]]; then
+        opt_emit ev=progress done#="$PROCESSED" total#="$TOTAL_FILES" \
+            ok#="$OPTIMIZED" skipped#="$SKIPPED" history#="$HISTORY" \
+            failed#="$FAILED" saved#="$SAVED"
+    else
+        printf '\r\033[K'
+
+        printf '[%3d%%] %d/%d | OK: %d | Skip: %d | Já feitas: %d | Erros: %d | Economia: %s | Workers: %d' \
+            "$PERCENT" \
+            "$PROCESSED" \
+            "$TOTAL_FILES" \
+            "$OPTIMIZED" \
+            "$SKIPPED" \
+            "$HISTORY" \
+            "$FAILED" \
+            "$(human_bytes "$SAVED")" \
+            "$JOBS"
+    fi
 
     sleep 1
 done
 
 wait "$WORK_PID"
 
+collect_status
+
+ELAPSED=$(($(date +%s) - START_TIME))
+
+opt_emit ev=progress done#="$PROCESSED" total#="$TOTAL_FILES" \
+    ok#="$OPTIMIZED" skipped#="$SKIPPED" history#="$HISTORY" \
+    failed#="$FAILED" saved#="$SAVED"
+
+opt_emit ev=end status=done \
+    ok#="$OPTIMIZED" skipped#="$((SKIPPED + HISTORY))" failed#="$FAILED" \
+    saved#="$SAVED" elapsed#="$ELAPSED" log="$LOG_FILE"
+
 echo
 echo
 echo "Finalizado."
+echo "Economia: $(human_bytes "$SAVED")"
 echo "Log:"
 echo "  $LOG_FILE"

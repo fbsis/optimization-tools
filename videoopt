@@ -2,6 +2,22 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+
+for OPTLIB in "${SCRIPT_DIR}/optlib.sh" /usr/local/lib/opt/optlib.sh; do
+    if [[ -f "$OPTLIB" ]]; then
+        # shellcheck disable=SC1090
+        source "$OPTLIB"
+        break
+    fi
+done
+
+if ! declare -F opt_emit >/dev/null; then
+    echo "ERRO: optlib.sh não encontrado."
+    echo "Instale com: sudo install -D -m 0644 optlib.sh /usr/local/lib/opt/optlib.sh"
+    exit 1
+fi
+
 TRANSCODER_HOST="192.168.1.116"
 TRANSCODER_USER="transcoder"
 REMOTE_BASE="/home/transcoder/jobs"
@@ -27,12 +43,94 @@ VIDEO_EXTENSIONS=(
     wmv
 )
 
+MODE=""
+ASSUME_YES=0
+PATH_ARGS=()
+
+show_help() {
+    cat <<'EOF'
+
+Uso: videoopt [opções] [arquivo|pasta ...]
+
+  Sem argumentos processa a pasta atual (recursivo).
+
+Opções:
+  --mode replace|optimized  Substituir original (padrão) ou criar -optimized.mp4
+  -y, --yes                 Não perguntar nada (usa o padrão)
+  --force                   Ignorar o histórico e reprocessar
+  --events                  Saída em JSON lines (usado pela TUI)
+  -h, --help                Esta ajuda
+
+EOF
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+        --events)
+            OPT_EVENTS=1
+            export OPT_EVENTS
+            ;;
+        --force)
+            OPT_FORCE=1
+            ;;
+        -y|--yes)
+            ASSUME_YES=1
+            ;;
+        --mode)
+            MODE="${2:-}"
+            shift
+            ;;
+        --mode=*)
+            MODE="${1#--mode=}"
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --)
+            shift
+            PATH_ARGS+=("$@")
+            break
+            ;;
+        *)
+            PATH_ARGS+=("$1")
+            ;;
+    esac
+
+    shift
+done
+
+case "$MODE" in
+    ""|replace|optimized)
+        ;;
+    *)
+        echo "Modo inválido: $MODE (use replace ou optimized)"
+        exit 1
+        ;;
+esac
+
+if [[ "$OPT_EVENTS" == "1" ]]; then
+    ASSUME_YES=1
+fi
+
+opt_events_init "$LOG_FILE"
+
 TOTAL=0
 PROCESSED=0
 SUCCESS=0
 FAILED=0
 SKIPPED=0
 TOTAL_SAVED=0
+
+HIST_SKIPPED=0
+EFFICIENT_SKIPPED=0
+
+CURRENT_REMOTE_DIR=""
+CURRENT_LOCAL_TMP=""
+CURRENT_JOB_ID=""
+
+CUR_NAME=""
+CUR_ORIG=0
 
 START_TIME="$(date +%s)"
 
@@ -70,6 +168,8 @@ is_video() {
 }
 
 show_progress() {
+    [[ "$OPT_EVENTS" == "1" ]] && return 0
+
     local now elapsed percent
 
     now="$(date +%s)"
@@ -92,8 +192,133 @@ show_progress() {
     echo "------------------------------------------"
 }
 
+remote() {
+    ssh -n -o ConnectTimeout=10 "${TRANSCODER_USER}@${TRANSCODER_HOST}" "$@"
+}
+
+# Remove o job remoto (matando ffmpeg órfão) e o arquivo local parcial.
+cleanup_current() {
+    if [[ -n "$CURRENT_REMOTE_DIR" ]]; then
+        remote "pkill -f 'transcode-jo[b] .*${CURRENT_JOB_ID}'; pkill -f 'ffmpe[g] .*${CURRENT_JOB_ID}'; rm -rf '${CURRENT_REMOTE_DIR}'" \
+            >/dev/null 2>&1 || true
+    fi
+
+    if [[ -n "$CURRENT_LOCAL_TMP" ]]; then
+        rm -f -- "$CURRENT_LOCAL_TMP"
+    fi
+
+    CURRENT_REMOTE_DIR=""
+    CURRENT_LOCAL_TMP=""
+    CURRENT_JOB_ID=""
+}
+
+on_signal() {
+    echo
+    log "Interrompido pelo usuário"
+
+    cleanup_current
+
+    opt_emit ev=end status=canceled \
+        ok#="$SUCCESS" skipped#="$SKIPPED" failed#="$FAILED" \
+        saved#="$TOTAL_SAVED" log="$LOG_FILE"
+
+    exit 130
+}
+
+trap on_signal INT TERM
+
+file_ok() {
+    local saved="$1" new_size="$2"
+
+    TOTAL_SAVED=$((TOTAL_SAVED + saved))
+
+    ((SUCCESS++))
+    ((PROCESSED++))
+
+    opt_emit ev=result status=ok name="$CUR_NAME" \
+        orig#="$CUR_ORIG" new#="$new_size" saved#="$saved"
+}
+
+file_skip() {
+    local msg="$1" new_size="${2:-0}"
+
+    ((SKIPPED++))
+    ((PROCESSED++))
+
+    opt_emit ev=result status=skip name="$CUR_NAME" \
+        orig#="$CUR_ORIG" new#="$new_size" msg="$msg"
+}
+
+file_fail() {
+    local msg="$1"
+
+    ((FAILED++))
+    ((PROCESSED++))
+
+    cleanup_current
+
+    opt_emit ev=result status=fail name="$CUR_NAME" \
+        orig#="$CUR_ORIG" msg="$msg"
+}
+
+# rsync com progresso. Em modo --events converte "NN%" em eventos de etapa.
+run_rsync() {
+    local stage="$1"
+    shift
+
+    if [[ "$OPT_EVENTS" != "1" ]]; then
+        rsync -ah --info=progress2 -- "$@"
+        return $?
+    fi
+
+    local last=-1
+    local line
+
+    rsync -ah --info=progress2 -- "$@" 2>&1 |
+    while IFS= read -r -d $'\r' line; do
+        if [[ "$line" =~ ([0-9]+)% ]]; then
+            if [[ "${BASH_REMATCH[1]}" != "$last" ]]; then
+                last="${BASH_REMATCH[1]}"
+                opt_emit ev=stage stage="$stage" pct#="$last"
+            fi
+        fi
+    done
+
+    return "${PIPESTATUS[0]}"
+}
+
+run_transcode() {
+    local remote_input="$1"
+    local remote_output="$2"
+
+    if [[ "$OPT_EVENTS" != "1" ]]; then
+        ssh \
+            -t \
+            "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
+            "/usr/local/bin/transcode-job '$remote_input' '$remote_output'"
+        return $?
+    fi
+
+    local line
+
+    ssh \
+        -n \
+        "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
+        "MACHINE=1 /usr/local/bin/transcode-job '$remote_input' '$remote_output'" |
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^PCT\ ([0-9]+)$ ]]; then
+            opt_emit ev=stage stage=convert pct#="${BASH_REMATCH[1]}"
+        else
+            log "transcode: $line"
+        fi
+    done
+
+    return "${PIPESTATUS[0]}"
+}
+
 convert_video() {
     local input="$1"
+    local original_fp="$2"
 
     input="$(realpath "$input")"
 
@@ -117,6 +342,12 @@ convert_video() {
     remote_input="${remote_dir}/input"
     remote_output="${remote_dir}/output.mp4"
 
+    CUR_NAME="$filename"
+    CUR_ORIG="$(opt_file_size "$input")"
+
+    opt_emit ev=file i#="$((PROCESSED + 1))" total#="$TOTAL" \
+        name="$filename" path="$input" size#="$CUR_ORIG"
+
     if [[ "$MODE" == "optimized" ]]; then
         local_output="${directory}/${name}-optimized.mp4"
 
@@ -125,18 +356,15 @@ convert_video() {
             echo "Já existe:"
             echo "$local_output"
 
-            ((SKIPPED++))
-            ((PROCESSED++))
-
             log "SKIP já existe: $local_output"
+            file_skip "já existe -optimized"
             return
         fi
     else
         local_output="${directory}/.${name}.videoopt-${job_id}.mp4"
     fi
 
-    local original_size
-    original_size="$(stat -c '%s' "$input")"
+    local original_size="$CUR_ORIG"
 
     echo
     echo "=========================================="
@@ -147,39 +375,28 @@ convert_video() {
 
     log "INICIANDO: $input"
 
-    if ! ssh \
-        "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
-        "mkdir -p '$remote_dir'"; then
+    CURRENT_JOB_ID="$job_id"
+    CURRENT_REMOTE_DIR="$remote_dir"
 
+    if ! remote "mkdir -p '$remote_dir'"; then
         echo "ERRO criando job remoto."
-
-        ((FAILED++))
-        ((PROCESSED++))
-
         log "ERRO SSH mkdir: $input"
+        file_fail "erro criando job remoto"
         return
     fi
 
     echo
     echo "Enviando para transcoder..."
 
-    if ! rsync \
-        -ah \
-        --info=progress2 \
-        -- \
+    opt_emit ev=stage stage=upload pct#=0
+
+    if ! run_rsync upload \
         "$input" \
         "${TRANSCODER_USER}@${TRANSCODER_HOST}:${remote_input}"; then
 
         echo "ERRO enviando arquivo."
-
-        ssh \
-            "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
-            "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
-
-        ((FAILED++))
-        ((PROCESSED++))
-
         log "ERRO upload: $input"
+        file_fail "erro no envio"
         return
     fi
 
@@ -187,57 +404,41 @@ convert_video() {
     echo "Convertendo no LXC com GPU..."
     echo
 
-    if ! ssh \
-        -t \
-        "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
-        "/usr/local/bin/transcode-job '$remote_input' '$remote_output'"; then
+    opt_emit ev=stage stage=convert pct#=0
 
+    if ! run_transcode "$remote_input" "$remote_output"; then
         echo
         echo "ERRO durante conversão."
-
-        ssh \
-            "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
-            "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
-
-        ((FAILED++))
-        ((PROCESSED++))
-
         log "ERRO ffmpeg: $input"
+        file_fail "erro na conversão"
         return
     fi
 
     echo
     echo "Recebendo resultado..."
 
-    if ! rsync \
-        -ah \
-        --info=progress2 \
-        -- \
+    CURRENT_LOCAL_TMP="$local_output"
+
+    opt_emit ev=stage stage=download pct#=0
+
+    if ! run_rsync download \
         "${TRANSCODER_USER}@${TRANSCODER_HOST}:${remote_output}" \
         "$local_output"; then
 
         echo
         echo "ERRO recebendo resultado."
-
-        rm -f "$local_output"
-
-        ssh \
-            "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
-            "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
-
-        ((FAILED++))
-        ((PROCESSED++))
-
         log "ERRO download: $input"
+        file_fail "erro ao receber"
         return
     fi
 
-    ssh \
-        "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
-        "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
+    remote "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
+
+    CURRENT_REMOTE_DIR=""
+    CURRENT_JOB_ID=""
 
     local new_size
-    new_size="$(stat -c '%s' "$local_output")"
+    new_size="$(opt_file_size "$local_output")"
 
     echo
     echo "Original:   $(human_bytes "$original_size")"
@@ -248,23 +449,27 @@ convert_video() {
         echo "Conversão não reduziu o tamanho."
 
         rm -f "$local_output"
+        CURRENT_LOCAL_TMP=""
 
-        ((SKIPPED++))
-        ((PROCESSED++))
+        opt_history_add "$original_fp" video skip-larger \
+            "$original_size" "$new_size" videoopt vaapi-h264
 
         log "SKIP maior/igual: $input"
+        file_skip "não reduziu o tamanho" "$new_size"
         return
     fi
 
     local saved
     saved=$((original_size - new_size))
 
+    local final_file
+
     if [[ "$MODE" == "replace" ]]; then
         chmod --reference="$input" "$local_output" 2>/dev/null || true
         chown --reference="$input" "$local_output" 2>/dev/null || true
         touch -r "$input" "$local_output" 2>/dev/null || true
 
-        local final_file="${directory}/${name}.mp4"
+        final_file="${directory}/${name}.mp4"
 
         rm -f -- "$input"
         mv -- "$local_output" "$final_file"
@@ -275,6 +480,8 @@ convert_video() {
 
         log "SUBSTITUÍDO: $input -> $final_file"
     else
+        final_file="$local_output"
+
         echo
         echo "Criado:"
         echo "$local_output"
@@ -282,18 +489,40 @@ convert_video() {
         log "CRIADO: $local_output"
     fi
 
-    TOTAL_SAVED=$((TOTAL_SAVED + saved))
+    CURRENT_LOCAL_TMP=""
 
-    ((SUCCESS++))
-    ((PROCESSED++))
+    # Histórico: o arquivo novo passa a contar como já otimizado
+    # (e o original também, útil no modo -optimized).
+    opt_history_add "$(opt_fingerprint "$final_file")" video ok \
+        "$original_size" "$new_size" videoopt vaapi-h264
+
+    if [[ "$MODE" == "optimized" ]]; then
+        opt_history_add "$original_fp" video ok \
+            "$original_size" "$new_size" videoopt vaapi-h264
+    fi
 
     echo
     echo "Economizado: $(human_bytes "$saved")"
+
+    file_ok "$saved" "$new_size"
 }
+
+# ffprobe é requisito: sem ele não dá para pular vídeos já eficientes.
+if ! command -v ffprobe >/dev/null 2>&1; then
+    echo
+    echo "ERRO: ffprobe não encontrado (requisito)."
+    echo "Instale com:"
+    echo "  sudo apt install -y ffmpeg"
+
+    opt_emit ev=error msg="ffprobe não encontrado. Instale com: sudo apt install -y ffmpeg"
+
+    exit 1
+fi
 
 echo "Verificando transcoder..."
 
 if ! ssh \
+    -n \
     -o BatchMode=yes \
     -o ConnectTimeout=5 \
     "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
@@ -306,139 +535,236 @@ if ! ssh \
     echo "  ${TRANSCODER_USER}@${TRANSCODER_HOST}"
     echo
     echo "ou o transcode-job não existe."
+
+    opt_emit ev=error msg="Transcoder inacessível (${TRANSCODER_USER}@${TRANSCODER_HOST}) ou transcode-job ausente"
+
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Descoberta dos arquivos
+# ---------------------------------------------------------------------------
+
 FILES=()
 
-if (( $# > 0 )); then
-    INPUT="$1"
+find_videos() {
+    find "$1" \
+        -type f \
+        \( \
+            -iname '*.mp4' \
+            -o -iname '*.mkv' \
+            -o -iname '*.avi' \
+            -o -iname '*.mov' \
+            -o -iname '*.m4v' \
+            -o -iname '*.webm' \
+            -o -iname '*.mpg' \
+            -o -iname '*.mpeg' \
+            -o -iname '*.ts' \
+            -o -iname '*.mts' \
+            -o -iname '*.m2ts' \
+            -o -iname '*.wmv' \
+        \) \
+        ! -iname '*-optimized.mp4' \
+        ! -name '.*.videoopt-*.mp4' \
+        -print0
+}
 
-    if [[ ! -f "$INPUT" ]]; then
-        echo
-        echo "Arquivo não encontrado:"
-        echo "$INPUT"
-        exit 1
-    fi
-
-    if ! is_video "$INPUT"; then
-        echo
-        echo "Formato não reconhecido:"
-        echo "$INPUT"
-        exit 1
-    fi
-
-    FILES+=("$(realpath "$INPUT")")
-else
-    CURRENT="$(pwd)"
+if (( ${#PATH_ARGS[@]} == 0 )); then
+    PATH_ARGS=("$(pwd)")
 
     echo
     echo "Nenhum arquivo informado."
     echo "Processando recursivamente:"
     echo
-    echo "  $CURRENT"
+    echo "  $(pwd)"
     echo
-
-    while IFS= read -r -d '' FILE; do
-        FILES+=("$FILE")
-    done < <(
-        find "$CURRENT" \
-            -type f \
-            \( \
-                -iname '*.mp4' \
-                -o -iname '*.mkv' \
-                -o -iname '*.avi' \
-                -o -iname '*.mov' \
-                -o -iname '*.m4v' \
-                -o -iname '*.webm' \
-                -o -iname '*.mpg' \
-                -o -iname '*.mpeg' \
-                -o -iname '*.ts' \
-                -o -iname '*.mts' \
-                -o -iname '*.m2ts' \
-                -o -iname '*.wmv' \
-            \) \
-            ! -iname '*-optimized.mp4' \
-            -print0
-    )
 fi
 
-TOTAL="${#FILES[@]}"
+for ARG in "${PATH_ARGS[@]}"; do
+    if [[ -d "$ARG" ]]; then
+        while IFS= read -r -d '' FILE; do
+            FILES+=("$FILE")
+        done < <(find_videos "$ARG")
+    elif [[ -f "$ARG" ]]; then
+        if is_video "$ARG"; then
+            FILES+=("$(realpath "$ARG")")
+        else
+            echo
+            echo "Formato não reconhecido:"
+            echo "$ARG"
+            opt_emit ev=warn msg="Formato não reconhecido: $ARG"
+
+            (( ${#PATH_ARGS[@]} == 1 )) && exit 1
+        fi
+    else
+        echo
+        echo "Não encontrado:"
+        echo "$ARG"
+        opt_emit ev=warn msg="Não encontrado: $ARG"
+
+        (( ${#PATH_ARGS[@]} == 1 )) && exit 1
+    fi
+done
+
+FOUND="${#FILES[@]}"
+
+# ---------------------------------------------------------------------------
+# Filtro: histórico e vídeos já eficientes
+# ---------------------------------------------------------------------------
+
+TODO_FILES=()
+TODO_FPS=()
+
+SCANNED=0
+
+for FILE in ${FILES[@]+"${FILES[@]}"}; do
+    ((SCANNED++))
+
+    FP="$(opt_fingerprint "$FILE")" || FP=""
+
+    if (( SCANNED % 10 == 0 )); then
+        opt_emit ev=scan done#="$SCANNED" total#="$FOUND"
+    fi
+
+    if [[ "$OPT_FORCE" != "1" ]]; then
+        if [[ -n "$FP" ]] && opt_history_has "$FP"; then
+            ((HIST_SKIPPED++))
+            continue
+        fi
+
+        if opt_video_efficient "$FILE"; then
+            ((EFFICIENT_SKIPPED++))
+
+            SIZE="$(opt_file_size "$FILE")"
+            opt_history_add "$FP" video efficient "$SIZE" "$SIZE" videoopt ""
+
+            log "SKIP eficiente: $FILE"
+            continue
+        fi
+    fi
+
+    TODO_FILES+=("$FILE")
+    TODO_FPS+=("$FP")
+done
+
+TOTAL="${#TODO_FILES[@]}"
+
+opt_emit ev=scan done#="$FOUND" total#="$FOUND" \
+    found#="$FOUND" todo#="$TOTAL" \
+    history#="$HIST_SKIPPED" efficient#="$EFFICIENT_SKIPPED"
 
 if (( TOTAL == 0 )); then
     echo
-    echo "Nenhum vídeo encontrado."
+    if (( FOUND == 0 )); then
+        echo "Nenhum vídeo encontrado."
+    else
+        echo "Nada a fazer: $HIST_SKIPPED já otimizado(s) no histórico," \
+             "$EFFICIENT_SKIPPED já eficiente(s)."
+    fi
+
+    opt_emit ev=end status=empty ok#=0 skipped#=0 failed#=0 saved#=0 log="$LOG_FILE"
+
     exit 0
 fi
 
-echo
-echo "=========================================="
-echo "               VIDEOOPT"
-echo "=========================================="
-echo
-echo "Vídeos encontrados:"
-echo "  $TOTAL"
-echo
-echo "Transcoder:"
-echo "  ${TRANSCODER_HOST}"
-echo
-echo "Modo padrão do servidor:"
-echo "  H.264 Intel VAAPI / GPU"
-echo
-echo "Escolha:"
-echo
-echo "  [1] Criar arquivo -optimized.mp4"
-echo "  [2] Substituir original"
-echo "  [3] Cancelar"
-echo
+# ---------------------------------------------------------------------------
+# Menu (somente modo interativo)
+# ---------------------------------------------------------------------------
 
-while true; do
-    read -r -p "Escolha [1/2/3]: " OPTION
+if (( ASSUME_YES == 0 )); then
+    echo
+    echo "=========================================="
+    echo "               VIDEOOPT"
+    echo "=========================================="
+    echo
+    echo "Vídeos encontrados:"
+    echo "  $FOUND"
+    echo
+    echo "A processar:"
+    echo "  $TOTAL"
+    echo
+    echo "Ignorados:"
+    echo "  $HIST_SKIPPED já otimizados (histórico)"
+    echo "  $EFFICIENT_SKIPPED já eficientes"
+    echo
+    echo "Transcoder:"
+    echo "  ${TRANSCODER_HOST}"
+    echo
+    echo "Modo padrão do servidor:"
+    echo "  H.264 Intel VAAPI / GPU"
+    echo
+fi
 
-    case "$OPTION" in
-        1)
-            MODE="optimized"
-            break
-            ;;
-        2)
-            MODE="replace"
-            break
-            ;;
-        3)
-            exit 0
+if [[ -z "$MODE" ]]; then
+    if (( ASSUME_YES == 1 )); then
+        MODE="replace"
+    else
+        echo "Escolha:"
+        echo
+        echo "  [1] Criar arquivo -optimized.mp4"
+        echo "  [2] Substituir original (padrão)"
+        echo "  [3] Cancelar"
+        echo
+
+        while true; do
+            read -r -p "Escolha [1/2/3] (Enter=2): " OPTION
+
+            case "$OPTION" in
+                1)
+                    MODE="optimized"
+                    break
+                    ;;
+                ""|2)
+                    MODE="replace"
+                    break
+                    ;;
+                3)
+                    exit 0
+                    ;;
+                *)
+                    echo "Escolha 1, 2 ou 3."
+                    ;;
+            esac
+        done
+    fi
+fi
+
+if (( ASSUME_YES == 0 )); then
+    echo
+    echo "Serão processados $TOTAL vídeo(s)."
+    echo
+
+    read -r -p "Confirmar? [S/n]: " CONFIRM
+
+    case "${CONFIRM,,}" in
+        ""|s|sim|y|yes)
             ;;
         *)
-            echo "Escolha 1, 2 ou 3."
+            echo "Cancelado."
+            exit 0
             ;;
     esac
-done
-
-echo
-echo "Serão processados $TOTAL vídeo(s)."
-echo
-
-read -r -p "Confirmar? [s/n]: " CONFIRM
-
-case "${CONFIRM,,}" in
-    s|sim|y|yes)
-        ;;
-    *)
-        echo "Cancelado."
-        exit 0
-        ;;
-esac
+fi
 
 log "VIDEOOPT iniciado"
 log "Total: $TOTAL"
 log "Modo: $MODE"
 
-for FILE in "${FILES[@]}"; do
-    convert_video "$FILE"
+opt_emit ev=start total#="$TOTAL" mode="$MODE"
+
+START_TIME="$(date +%s)"
+
+for INDEX in "${!TODO_FILES[@]}"; do
+    convert_video "${TODO_FILES[$INDEX]}" "${TODO_FPS[$INDEX]}"
     show_progress
 done
 
 END_TIME="$(date +%s)"
 ELAPSED=$((END_TIME - START_TIME))
+
+opt_emit ev=end status=done \
+    ok#="$SUCCESS" skipped#="$SKIPPED" failed#="$FAILED" \
+    saved#="$TOTAL_SAVED" elapsed#="$ELAPSED" log="$LOG_FILE"
 
 echo
 echo
