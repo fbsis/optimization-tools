@@ -673,6 +673,7 @@ class BrowserScreen(Screen):
 
 STAGE_LABEL = {"upload": "Enviando ao transcoder", "convert": "Convertendo (GPU)",
                "download": "Recebendo resultado"}
+STAGE_ICON = {"upload": "⬆", "convert": "⚙", "download": "⬇"}
 STAGE_RANGE = {"upload": (0.0, 0.2), "convert": (0.2, 0.8), "download": (0.8, 1.0)}
 
 
@@ -707,6 +708,9 @@ class RunScreen(Screen):
         self.row_n = 0
         self.step_label = ""
         self.stage_frac = 0.0
+        self.overall_frac = 0.0
+        self.stage_name = ""
+        self.stage_pct = 0
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -716,6 +720,7 @@ class RunScreen(Screen):
             yield ProgressBar(total=100, show_eta=False, id="overall")
             yield Static("", id="stage", classes="lbl")
             yield ProgressBar(total=100, show_eta=False, id="stagebar")
+            yield Static("", id="detail", classes="lbl")
             yield Static("", id="current", markup=False)
             yield Static("", id="totals")
         yield DataTable(id="results", cursor_type="row", zebra_stripes=True)
@@ -734,6 +739,7 @@ class RunScreen(Screen):
     def tick(self) -> None:
         if not self.finished:
             self.update_totals()
+            self.update_detail()
 
     def update_totals(self) -> None:
         elapsed = hms(time.time() - self.started)
@@ -742,12 +748,36 @@ class RunScreen(Screen):
             f"[red]✗ {self.failed}[/red]   ·   economia [b]{human(self.saved)}[/b]   ·   {elapsed}"
         )
 
+    def update_detail(self) -> None:
+        elapsed = time.time() - self.started
+        frac = min(max(self.overall_frac, 0.0), 1.0)
+
+        parts = [f"⏱ {hms(int(elapsed))}"]
+
+        if frac > 0.02:
+            parts.append(f"restante ~{hms(int(elapsed / frac - elapsed))}")
+
+        if self.stage_name:
+            parts.append(f"{STAGE_ICON.get(self.stage_name, '•')} "
+                         f"{STAGE_LABEL.get(self.stage_name, self.stage_name)} {self.stage_pct}%")
+
+        parts.append(f"geral {int(frac * 100)}%")
+
+        self.query_one("#detail", Static).update("   ·   ".join(parts))
+
     def set_overall(self, frac: float) -> None:
+        self.overall_frac = frac
         self.query_one("#overall", ProgressBar).update(total=1000, progress=int(frac * 1000))
+        self.update_detail()
 
     def set_stage(self, name: str, pct: int) -> None:
-        self.query_one("#stage", Static).update(f"{self.step_label} · {STAGE_LABEL.get(name, name)}")
+        self.stage_name = name
+        self.stage_pct = pct
+        self.query_one("#stage", Static).update(
+            f"{self.step_label} · {STAGE_ICON.get(name, '•')} {STAGE_LABEL.get(name, name)} — [b]{pct}%[/b]"
+        )
         self.query_one("#stagebar", ProgressBar).update(total=100, progress=pct)
+        self.update_detail()
 
     # -- motores -------------------------------------------------------
 
@@ -843,7 +873,10 @@ class RunScreen(Screen):
             total = int(ev.get("total", total))
             cur.update(f"{ev.get('i', '?')}/{total}  {ev.get('name', '')}  ({human(ev.get('size', 0))})")
             self.stage_frac = 0.0
+            self.stage_name = ""
+            self.stage_pct = 0
             self.query_one("#stagebar", ProgressBar).update(total=100, progress=0)
+            self.query_one("#stage", Static).update(f"{self.step_label} · novo arquivo")
         elif kind == "stage":
             name = ev.get("stage", "")
             pct = int(ev.get("pct", 0))
