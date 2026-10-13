@@ -220,42 +220,45 @@ optimize_file() {
 
     case "$ext" in
         jpg|jpeg)
-            if ! "$IMG_CMD" "$src" \
+            local err=""
+            if ! err="$("$IMG_CMD" "$src" \
                 -auto-orient \
                 -strip \
                 -sampling-factor 4:2:0 \
                 -interlace Plane \
                 -quality "$jpeg_quality" \
-                "$temp"; then
+                "$temp" 2>&1)"; then
 
                 rm -f "$temp"
-                echo "FAIL|$src_size|$src_size" > "$status_file"
+                image_fail "$src" "$src_size" "$status_file" "$log_file" "$err"
                 return 0
             fi
             ;;
 
         png)
-            if ! "$IMG_CMD" "$src" \
+            local err=""
+            if ! err="$("$IMG_CMD" "$src" \
                 -strip \
                 -define png:compression-level=9 \
                 -define png:compression-strategy=1 \
-                "$temp"; then
+                "$temp" 2>&1)"; then
 
                 rm -f "$temp"
-                echo "FAIL|$src_size|$src_size" > "$status_file"
+                image_fail "$src" "$src_size" "$status_file" "$log_file" "$err"
                 return 0
             fi
             ;;
 
         webp)
-            if ! "$IMG_CMD" "$src" \
+            local err=""
+            if ! err="$("$IMG_CMD" "$src" \
                 -auto-orient \
                 -strip \
                 -quality "$webp_quality" \
-                "$temp"; then
+                "$temp" 2>&1)"; then
 
                 rm -f "$temp"
-                echo "FAIL|$src_size|$src_size" > "$status_file"
+                image_fail "$src" "$src_size" "$status_file" "$log_file" "$err"
                 return 0
             fi
             ;;
@@ -353,12 +356,41 @@ optimize_file() {
     return 0
 }
 
-export -f optimize_file
+# Resume o motivo da falha do ImageMagick (primeira linha útil).
+image_reason() {
+    local text="$1"
+    local line
+
+    line="$(printf '%s' "$text" |
+        grep -aiE 'no decode delegate|improper image header|insufficient image data|no such file|permission denied|not authorized|unable to|cannot|invalid|corrupt' |
+        head -1 | sed -E 's/^[[:space:]]*//')"
+
+    [[ -n "$line" ]] || line="$(printf '%s' "$text" | head -1)"
+    [[ -n "$line" ]] || line="falha do ImageMagick"
+
+    printf '%s' "${line:0:140}"
+}
+
+# Marca a falha: grava o motivo no status (4º campo) e no log.
+image_fail() {
+    local src="$1" size="$2" status_file="$3" log_file="$4" err="$5"
+    local reason
+
+    reason="$(image_reason "$err")"
+
+    echo "FAIL|$size|$size|$reason" > "$status_file"
+
+    printf '[%s] ERRO: %s | %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$src" "$reason" >> "$log_file"
+}
+
+export -f optimize_file image_reason image_fail
 
 
 find_images() {
     find "$1" \
         -type f \
+        ! -name '._*' \
         \( \
             -iname '*.jpg' \
             -o -iname '*.jpeg' \
@@ -369,6 +401,11 @@ find_images() {
 }
 
 is_image() {
+    # AppleDouble/metadados do macOS não são imagens
+    case "${1##*/}" in
+        ._*|.DS_Store|Thumbs.db|desktop.ini) return 1 ;;
+    esac
+
     case "${1,,}" in
         *.jpg|*.jpeg|*.png|*.webp)
             return 0
@@ -596,7 +633,7 @@ collect_status() {
     shopt -s nullglob
 
     for status in "$STATUS_DIR"/*; do
-        IFS='|' read -r result old new < "$status" || continue
+        IFS='|' read -r result old new reason < "$status" || continue
 
         ((PROCESSED++))
         original_bytes=$((original_bytes + old))

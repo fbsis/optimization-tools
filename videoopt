@@ -162,6 +162,11 @@ is_video() {
     local file="$1"
     local ext
 
+    # AppleDouble/metadados do macOS não são vídeos
+    case "${file##*/}" in
+        ._*|.DS_Store|Thumbs.db|desktop.ini) return 1 ;;
+    esac
+
     ext="${file##*.}"
     ext="${ext,,}"
 
@@ -306,33 +311,66 @@ run_rsync() {
     return "${PIPESTATUS[0]}"
 }
 
+# Resume o motivo da falha do ffmpeg a partir da saída capturada.
+transcode_reason() {
+    local capture="$1"
+    local line
+
+    line="$(grep -aoiE \
+        'Invalid data found when processing input|moov atom not found|No such file or directory|Permission denied|Unsupported codec|Decoder not found|Conversion failed|Invalid argument' \
+        "$capture" 2>/dev/null | head -1)"
+
+    if [[ -z "$line" ]]; then
+        line="$(grep -aE 'Error' "$capture" 2>/dev/null |
+            head -1 | sed -E 's/^\[[^]]*\] *//; s/^[[:space:]]*//')"
+    fi
+
+    [[ -n "$line" ]] || line="falha no ffmpeg (o arquivo pode não ser um vídeo válido)"
+
+    printf '%s' "${line:0:140}"
+}
+
 run_transcode() {
     local remote_input="$1"
     local remote_output="$2"
+
+    TRANSCODE_REASON=""
+
+    local capture
+    capture="$(mktemp)"
+    local rc=0
 
     if [[ "$OPT_EVENTS" != "1" ]]; then
         ssh \
             -t \
             "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
-            "/usr/local/bin/transcode-job '$remote_input' '$remote_output'"
-        return $?
+            "/usr/local/bin/transcode-job '$remote_input' '$remote_output'" 2>&1 |
+            tee "$capture"
+        rc="${PIPESTATUS[0]}"
+    else
+        local line
+
+        ssh \
+            -n \
+            "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
+            "MACHINE=1 /usr/local/bin/transcode-job '$remote_input' '$remote_output'" 2>&1 |
+            tee "$capture" |
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^PCT\ ([0-9]+)$ ]]; then
+                opt_emit ev=stage stage=convert pct#="${BASH_REMATCH[1]}"
+            else
+                log "transcode: $line"
+            fi
+        done
+        rc="${PIPESTATUS[0]}"
     fi
 
-    local line
+    if (( rc != 0 )); then
+        TRANSCODE_REASON="$(transcode_reason "$capture")"
+    fi
 
-    ssh \
-        -n \
-        "${TRANSCODER_USER}@${TRANSCODER_HOST}" \
-        "MACHINE=1 /usr/local/bin/transcode-job '$remote_input' '$remote_output'" |
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^PCT\ ([0-9]+)$ ]]; then
-            opt_emit ev=stage stage=convert pct#="${BASH_REMATCH[1]}"
-        else
-            log "transcode: $line"
-        fi
-    done
-
-    return "${PIPESTATUS[0]}"
+    rm -f "$capture"
+    return "$rc"
 }
 
 convert_video() {
@@ -427,10 +465,13 @@ convert_video() {
     opt_emit ev=stage stage=convert pct#=0
 
     if ! run_transcode "$remote_input" "$remote_output"; then
+        local reason="${TRANSCODE_REASON:-erro desconhecido}"
+
         echo
         echo "ERRO durante conversão."
-        log "ERRO ffmpeg: $input"
-        file_fail "erro na conversão"
+        echo "Motivo: $reason"
+        log "ERRO ffmpeg: $input — $reason"
+        file_fail "conversão: $reason"
         return
     fi
 
@@ -573,6 +614,7 @@ FILES=()
 find_videos() {
     find "$1" \
         -type f \
+        ! -name '._*' \
         \( \
             -iname '*.mp4' \
             -o -iname '*.mkv' \
