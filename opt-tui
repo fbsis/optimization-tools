@@ -39,10 +39,6 @@ try:
         TabPane,
     )
     from textual.widgets.option_list import Option
-    try:
-        from textual.markup import escape
-    except ImportError:  # textual antigo
-        from rich.markup import escape
 except ImportError:  # pragma: no cover
     print("opt-tui precisa do pacote 'textual' (pipx install textual).", file=sys.stderr)
     sys.exit(3)
@@ -73,6 +69,23 @@ def human(n: float) -> str:
 def hms(seconds: float) -> str:
     seconds = int(seconds)
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def mk(markup: str, *dynamic: str) -> Text:
+    """Markup só nas partes fixas; partes dinâmicas (nomes de arquivo,
+    caminhos, mensagens) entram como texto puro, sem passar por parser."""
+    text = Text.from_markup(markup)
+    for part in dynamic:
+        text.append(part)
+    return text
+
+
+def say(widget, message: str, **kwargs) -> None:
+    """notify sem interpretar markup (nomes de arquivo têm colchetes)."""
+    try:
+        widget.notify(message, markup=False, **kwargs)
+    except TypeError:  # Textual antigo, sem o parâmetro
+        widget.notify(message.replace("[", "\\["), **kwargs)
 
 
 def fingerprint(path: str | os.PathLike, size: int | None = None) -> str:
@@ -338,7 +351,7 @@ class Confirm(ModalScreen[bool]):
     }
     """
 
-    def __init__(self, text: str):
+    def __init__(self, text):
         super().__init__()
         self.text = text
 
@@ -397,7 +410,7 @@ class BrowserScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static(id="path")
+        yield Static(id="path", markup=False)
         yield Static(id="options")
         yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
         yield Static(id="summary")
@@ -494,7 +507,7 @@ class BrowserScreen(Screen):
                 "  ·  [dim]Enter entra na pasta[/dim]")
 
     def update_header(self) -> None:
-        self.query_one("#path", Static).update(f"📁 {escape(str(self.cwd))}")
+        self.query_one("#path", Static).update(f"📁 {self.cwd}")
         self.query_one("#options", Static).update(self.kinds_text())
 
     def row_cells(self, name: str) -> list:
@@ -548,17 +561,17 @@ class BrowserScreen(Screen):
                 rel = os.path.relpath(self.scanning, self.cwd) if self.scanning else ""
             except ValueError:
                 rel = self.scanning
-            waiting = f"\n[yellow]⟳ lendo ({scanned}/{len(self.dirs)} pastas):[/yellow] {escape(rel)}"
+            waiting = (f"\n[yellow]⟳ lendo ({scanned}/{len(self.dirs)} pastas):[/yellow] ", rel)
         else:
-            waiting = ""
+            waiting = ("", "")
         v, i = total.video, total.image
         text = (
             f"Total aqui: {total.files} arquivos · "
             f"vídeos {v.n} ({human(v.size)}) · imagens {i.n} ({human(i.size)})  |  "
             f"pendente: vídeos {v.pending} ({human(v.pend_size)}) · "
-            f"imagens {i.pending} ({human(i.pend_size)}){waiting}"
+            f"imagens {i.pending} ({human(i.pend_size)}){waiting[0]}"
         )
-        self.query_one("#summary", Static).update(text)
+        self.query_one("#summary", Static).update(mk(text, waiting[1]))
 
     # -- ações ---------------------------------------------------------
 
@@ -633,17 +646,17 @@ class BrowserScreen(Screen):
 
     def action_optimize(self) -> None:
         if not (self.videos or self.images):
-            self.notify("Selecione vídeos e/ou imagens (v / i).", severity="warning")
+            say(self, "Selecione vídeos e/ou imagens (v / i).", severity="warning")
             return
         paths = sorted(self.marked) or [str(self.cwd)]
         what = " + ".join(
             n for n, on in (("vídeos", self.videos), ("imagens", self.images)) if on
         )
         mode = "CRIAR CÓPIA" if self.copy_mode else "SUBSTITUIR os originais"
-        listing = "\n".join(f"  • {escape(p)}" for p in paths[:8])
+        listing = "\n".join(f"  • {p}" for p in paths[:8])
         if len(paths) > 8:
             listing += f"\n  … +{len(paths) - 8}"
-        text = f"[b]Otimizar {what}[/b]\nModo: {mode}\n\n{listing}"
+        text = mk(f"[b]Otimizar {what}[/b]\nModo: {mode}\n\n", listing)
 
         def after(ok: bool | None) -> None:
             if ok:
@@ -703,7 +716,7 @@ class RunScreen(Screen):
             yield ProgressBar(total=100, show_eta=False, id="overall")
             yield Static("", id="stage", classes="lbl")
             yield ProgressBar(total=100, show_eta=False, id="stagebar")
-            yield Static("", id="current")
+            yield Static("", id="current", markup=False)
             yield Static("", id="totals")
         yield DataTable(id="results", cursor_type="row", zebra_stripes=True)
         yield Footer()
@@ -747,8 +760,8 @@ class RunScreen(Screen):
                 continue
             exe = find_engine(engine)
             if not exe:
-                self.query_one("#title", Static).update(f"[red]{escape(engine)} não encontrado[/red]")
-                self.notify(f"{engine} não encontrado no PATH.", severity="error")
+                self.query_one("#title", Static).update(f"[red]{engine} não encontrado[/red]")
+                say(self, f"{engine} não encontrado no PATH.", severity="error")
                 continue
             mode = ("optimized" if engine == "videoopt" else "parallel") if self.copy_mode else "replace"
             args = [exe, "--events", "--yes", "--mode", mode]
@@ -787,7 +800,7 @@ class RunScreen(Screen):
                 limit=1 << 20,
             )
         except OSError as exc:
-            self.notify(escape(f"Falha ao iniciar {engine}: {exc}"), severity="error")
+            say(self, f"Falha ao iniciar {engine}: {exc}", severity="error")
             return
 
         assert self.proc.stdout is not None
@@ -803,7 +816,7 @@ class RunScreen(Screen):
             total = self.handle(engine, ev, total)
         rc = await self.proc.wait()
         if rc not in (0, 130) and not self.cancelled:
-            self.notify(f"{engine} terminou com código {rc}", severity="warning")
+            say(self, f"{engine} terminou com código {rc}", severity="warning")
         self.proc = None
 
     def handle(self, engine: str, ev: dict, total: int) -> int:
@@ -812,7 +825,7 @@ class RunScreen(Screen):
 
         if kind == "check":
             i, tot = int(ev.get("i", 0)), max(int(ev.get("total", 1)), 1)
-            cur.update(f"Verificando {i}/{tot}  ·  {escape(str(ev.get('name', '')))}")
+            cur.update(f"Verificando {i}/{tot}  ·  {ev.get('name', '')}")
             self.query_one("#stage", Static).update(
                 f"{self.step_label} · verificando histórico e eficiência"
             )
@@ -828,7 +841,7 @@ class RunScreen(Screen):
             total = int(ev.get("total", 0))
         elif kind == "file":
             total = int(ev.get("total", total))
-            cur.update(f"{ev.get('i', '?')}/{total}  {escape(str(ev.get('name', '')))}  ({human(ev.get('size', 0))})")
+            cur.update(f"{ev.get('i', '?')}/{total}  {ev.get('name', '')}  ({human(ev.get('size', 0))})")
             self.stage_frac = 0.0
             self.query_one("#stagebar", ProgressBar).update(total=100, progress=0)
         elif kind == "stage":
@@ -870,7 +883,7 @@ class RunScreen(Screen):
             self.skipped = b_skip + int(ev.get("skipped", 0)) + int(ev.get("history", 0))
             self.failed = b_fail + int(ev.get("failed", 0))
             self.saved = b_saved + int(ev.get("saved", 0))
-            reading = f"\nlendo: {escape(str(ev['name']))}" if ev.get("name") else ""
+            reading = f"\nlendo: {ev['name']}" if ev.get("name") else ""
             cur.update(
                 f"{done}/{tot} imagens · {ev.get('history', 0)} já otimizadas (histórico){reading}"
             )
@@ -878,10 +891,10 @@ class RunScreen(Screen):
             self.query_one("#stagebar", ProgressBar).update(total=100, progress=int(done * 100 / tot))
             self.update_totals()
         elif kind == "error":
-            self.notify(escape(str(ev.get("msg", "erro"))), severity="error", timeout=10)
-            cur.update(f"[red]{escape(str(ev.get('msg', 'erro')))}[/red]")
+            say(self, str(ev.get("msg", "erro")), severity="error", timeout=10)
+            cur.update(Text(str(ev.get("msg", "erro")), style="red"))
         elif kind == "warn":
-            self.notify(escape(str(ev.get("msg", ""))), severity="warning")
+            say(self, str(ev.get("msg", "")), severity="warning")
         elif kind == "end":
             self.update_totals()
         return total
@@ -933,7 +946,7 @@ class HistoryScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static(id="hsummary")
+        yield Static(id="hsummary", markup=False)
         yield DataTable(cursor_type="row", zebra_stripes=True)
         yield Footer()
 
@@ -951,7 +964,7 @@ class HistoryScreen(Screen):
         ok = [e for e in entries if e.status == "ok"]
         saved = sum(max(e.orig - e.new, 0) for e in ok)
         self.query_one("#hsummary", Static).update(
-            f"{len(entries)} registros · {len(ok)} otimizados · economia total {human(saved)} · {escape(str(HISTORY_FILE))}"
+            f"{len(entries)} registros · {len(ok)} otimizados · economia total {human(saved)} · {HISTORY_FILE}"
         )
 
     def action_back(self) -> None:
@@ -1074,11 +1087,12 @@ class StatsScreen(Screen):
             f"  Execuções:          {len(sessions)}   ({len(done)} concluídas, {canceled} canceladas)\n"
             f"  Tempo total:        {hms(total_secs)}   (média {hms(avg_secs)} por sessão)\n"
             f"  Vazão média:        {human(rate)}/h de originais · {files_h:.0f} arquivos/h\n\n"
-            f"[dim]{escape(str(HISTORY_FILE))}\n{escape(str(SESSIONS_FILE))}[/dim]"
+            "[dim]Arquivos de dados:[/dim]"
         )
+        files = f"\n{HISTORY_FILE}\n{SESSIONS_FILE}"
         if not entries and not sessions:
-            text = "Ainda não há dados. Rode uma otimização e volte aqui."
-        self.query_one("#st_summary", Static).update(text)
+            text, files = "Ainda não há dados. Rode uma otimização e volte aqui.", ""
+        self.query_one("#st_summary", Static).update(mk(text, files))
 
     # -- tipo/formato --------------------------------------------------
 
@@ -1175,7 +1189,7 @@ class OptApp(App):
         yield Static("OPT · otimização de mídia", id="banner")
         yield OptionList(
             Option("🎬  Navegar pastas e otimizar        [dim]vídeos + imagens[/dim]", id="browse"),
-            Option(f"⚡  Otimizar a pasta atual            [dim]{escape(self.start.name or '/')}[/dim]", id="here"),
+            Option(mk("⚡  Otimizar a pasta atual            ", self.start.name or "/"), id="here"),
             Option("📊  Estatísticas                     [dim]economia, tempo, sessões[/dim]", id="stats"),
             Option("🕘  Histórico                        [dim]o que já foi feito[/dim]", id="history"),
             Option("📦  Filler                           [dim]mover p/ VeraCrypt[/dim]", id="filler"),
@@ -1197,8 +1211,8 @@ class OptApp(App):
         if choice == "browse":
             self.push_screen(BrowserScreen(self.start))
         elif choice == "here":
-            text = (f"[b]Otimizar vídeos + imagens[/b]\nModo: SUBSTITUIR os originais\n\n"
-                    f"  • {escape(str(self.start))}")
+            text = mk("[b]Otimizar vídeos + imagens[/b]\nModo: SUBSTITUIR os originais\n\n",
+                      f"  • {self.start}")
 
             def after(ok: bool | None) -> None:
                 if ok:
