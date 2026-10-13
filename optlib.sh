@@ -164,5 +164,44 @@ opt_video_efficient() {
     [[ "$verdict" == "yes" ]]
 }
 
+# ---------------------------------------------------------------------------
+# Garante o ffprobe (instala o ffmpeg sozinho, sem perguntar)
+# ---------------------------------------------------------------------------
+
+opt_ensure_ffprobe() {
+    command -v ffprobe >/dev/null 2>&1 && return 0
+
+    echo "ffprobe não encontrado. Instalando ffmpeg..."
+    opt_emit ev=warn msg="ffprobe não encontrado. Instalando ffmpeg..."
+
+    local -a SUDO=()
+
+    if [[ "$(id -u)" != "0" ]]; then
+        command -v sudo >/dev/null 2>&1 || return 1
+
+        # Sem terminal (TUI) não há como digitar senha: exige sudo sem senha.
+        if [[ "$OPT_EVENTS" == "1" ]]; then
+            SUDO=(sudo -n)
+        else
+            SUDO=(sudo)
+        fi
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        "${SUDO[@]}" apt-get update -qq &&
+            "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg
+    elif command -v dnf >/dev/null 2>&1; then
+        "${SUDO[@]}" dnf install -y ffmpeg
+    elif command -v pacman >/dev/null 2>&1; then
+        "${SUDO[@]}" pacman -S --noconfirm ffmpeg
+    elif command -v brew >/dev/null 2>&1; then
+        brew install ffmpeg
+    else
+        return 1
+    fi
+
+    command -v ffprobe >/dev/null 2>&1
+}
+
 export -f opt_file_size opt_md5 opt_fingerprint opt_history_has opt_history_add \
           opt_json_escape opt_emit

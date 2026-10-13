@@ -55,8 +55,9 @@ sudo apt install -y \
 ```
 
 O `ffmpeg` (que traz o `ffprobe`) é **requisito do `videoopt`**: ele verifica na
-partida e aborta se não encontrar. É com o `ffprobe` que os vídeos já eficientes
-são pulados.
+partida e, se não encontrar, **instala sozinho, sem perguntar** (apt, dnf, pacman
+ou brew; usa `sudo`, e na TUI exige `sudo` sem senha). É com o `ffprobe` que os
+vídeos já eficientes são pulados.
 
 Instale os comandos:
 

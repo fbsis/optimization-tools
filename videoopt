@@ -507,14 +507,14 @@ convert_video() {
     file_ok "$saved" "$new_size"
 }
 
-# ffprobe é requisito: sem ele não dá para pular vídeos já eficientes.
-if ! command -v ffprobe >/dev/null 2>&1; then
+# ffprobe é requisito: se faltar, instala o ffmpeg sozinho.
+if ! opt_ensure_ffprobe; then
     echo
-    echo "ERRO: ffprobe não encontrado (requisito)."
-    echo "Instale com:"
+    echo "ERRO: não foi possível instalar o ffprobe automaticamente."
+    echo "Instale manualmente:"
     echo "  sudo apt install -y ffmpeg"
 
-    opt_emit ev=error msg="ffprobe não encontrado. Instale com: sudo apt install -y ffmpeg"
+    opt_emit ev=error msg="Falha ao instalar o ffprobe. Instale manualmente: sudo apt install -y ffmpeg"
 
     exit 1
 fi
