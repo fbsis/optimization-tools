@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
-
+#
+# filler - move arquivos da pasta atual para o volume VeraCrypt até atingir a
+# margem de espaço livre configurada.
+#
+# Estratégia (tudo local - o filler roda dentro da própria VM):
+#   * mesmo filesystem ......... mv    (rename, instantâneo)
+#   * muitos arquivos PEQUENOS . tar   em stream (1 fluxo só; evita abrir/fechar
+#                                      milhares de arquivos no FUSE/VeraCrypt)
+#   * arquivos GRANDES ......... rsync -a --whole-file --remove-source-files
+#
 set -uo pipefail
 
 SOURCE="$(pwd)"
 DEST="/media/veracrypt64"
 
-RESERVE_BYTES=$((512 * 1024 * 1024))
+RESERVE_BYTES=$((512 * 1024 * 1024))   # margem de segurança no destino
+SMALL_MAX=$((64 * 1024 * 1024))        # até este tamanho vai no lote (tar)
 
 LOG_DIR="/var/log/filler"
 RUN_ID="$(date '+%Y%m%d-%H%M%S')"
@@ -24,166 +34,133 @@ human_bytes() {
 
 format_seconds() {
     local total="$1"
-
     printf '%02d:%02d:%02d' \
-        $((total / 3600)) \
-        $(((total % 3600) / 60)) \
-        $((total % 60))
+        $((total / 3600)) $(((total % 3600) / 60)) $((total % 60))
 }
 
 log() {
-    printf '[%s] %s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "$1" >> "$LOG_FILE"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
 }
 
 available_bytes() {
-    df \
-        -B1 \
-        --output=avail \
-        "$DEST" 2>/dev/null |
-        tail -n 1 |
-        tr -d ' '
+    df -B1 --output=avail "$DEST" 2>/dev/null | tail -n 1 | tr -d ' '
 }
 
 same_filesystem() {
-    local src_dev
-    local dst_dev
-
-    src_dev="$(stat -c '%d' "$1" 2>/dev/null)" || return 1
-    dst_dev="$(stat -c '%d' "$2" 2>/dev/null)" || return 1
-
-    [[ "$src_dev" == "$dst_dev" ]]
+    local a b
+    a="$(stat -c '%d' "$1" 2>/dev/null)" || return 1
+    b="$(stat -c '%d' "$2" 2>/dev/null)" || return 1
+    [[ "$a" == "$b" ]]
 }
 
 show_status() {
-    local now
-    local elapsed
-    local speed
-    local free
-    local usable
-    local eta
-
-    now="$(date +%s)"
-    elapsed=$((now - START_TIME))
-
-    free="$(available_bytes)"
-
-    [[ "$free" =~ ^[0-9]+$ ]] || free=0
-
-    usable=$((free - RESERVE_BYTES))
-
-    (( usable < 0 )) && usable=0
-
-    if (( elapsed > 0 )); then
-        speed=$((MOVED_BYTES / elapsed))
-    else
-        speed=0
-    fi
-
-    if (( speed > 0 )); then
-        eta=$((usable / speed))
-    else
-        eta=0
-    fi
+    local now elapsed speed free usable eta
+    now="$(date +%s)"; elapsed=$((now - START_TIME))
+    free="$(available_bytes)"; [[ "$free" =~ ^[0-9]+$ ]] || free=0
+    usable=$((free - RESERVE_BYTES)); (( usable < 0 )) && usable=0
+    if (( elapsed > 0 )); then speed=$((MOVED_BYTES / elapsed)); else speed=0; fi
+    if (( speed > 0 )); then eta=$((usable / speed)); else eta=0; fi
 
     printf '\r\033[K'
-
     printf 'Movidos: %s | Arquivos: %d | Vel: %s/s | Livre: %s | ETA: %s | Tempo: %s' \
-        "$(human_bytes "$MOVED_BYTES")" \
-        "$MOVED_FILES" \
-        "$(human_bytes "$speed")" \
-        "$(human_bytes "$free")" \
-        "$(format_seconds "$eta")" \
-        "$(format_seconds "$elapsed")"
+        "$(human_bytes "$MOVED_BYTES")" "$MOVED_FILES" "$(human_bytes "$speed")" \
+        "$(human_bytes "$free")" "$(format_seconds "$eta")" "$(format_seconds "$elapsed")"
+}
+
+# acompanha um processo em background, mostrando o progresso pelo crescimento
+# do destino a partir de <base>
+watch() {  # <pid> <base_bytes> <total_bytes> <rótulo>
+    local pid="$1" base="$2" total="$3" label="$4"
+    local cur d pct
+
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 0.5
+        cur=$(du -sb "$DEST" 2>/dev/null | awk '{print $1}'); cur=${cur:-0}
+        d=$(( cur - base )); (( d < 0 )) && d=0
+        if (( total > 0 )); then pct=$(( d * 100 / total )); else pct=0; fi
+        (( pct > 100 )) && pct=100
+        printf '\r\033[K  %s  %3d%%  (%s / %s)' \
+            "$label" "$pct" "$(human_bytes "$d")" "$(human_bytes "$total")"
+    done
+
+    wait "$pid" 2>/dev/null
+    return $?
 }
 
 finish() {
-    local elapsed
-    local free
-
+    local elapsed free
     elapsed=$(($(date +%s) - START_TIME))
     free="$(available_bytes)"
-
-    echo
-    echo
+    echo; echo
     echo "=========================================="
     echo "FILLER FINALIZADO"
     echo "=========================================="
     echo
-    echo "Origem:"
-    echo "  $SOURCE"
+    echo "Origem:";          echo "  $SOURCE"
     echo
-    echo "Destino:"
-    echo "  $DEST"
+    echo "Destino:";         echo "  $DEST"
     echo
-    echo "Movidos:"
-    echo "  $(human_bytes "$MOVED_BYTES")"
+    echo "Movidos:";         echo "  $(human_bytes "$MOVED_BYTES")"
     echo
-    echo "Arquivos:"
-    echo "  $MOVED_FILES"
+    echo "Arquivos:";        echo "  $MOVED_FILES"
     echo
-    echo "Falhas:"
-    echo "  $FAILED_FILES"
+    echo "Falhas:";          echo "  $FAILED_FILES"
     echo
-    echo "Ignorados:"
-    echo "  $SKIPPED_FILES"
+    echo "Ignorados:";       echo "  $SKIPPED_FILES"
     echo
-    echo "Tempo:"
-    echo "  $(format_seconds "$elapsed")"
+    echo "Tempo:";           echo "  $(format_seconds "$elapsed")"
     echo
-    echo "Espaço livre:"
-    echo "  $(human_bytes "${free:-0}")"
+    echo "Espaço livre:";    echo "  $(human_bytes "${free:-0}")"
     echo
-    echo "Log:"
-    echo "  $LOG_FILE"
+    echo "Log:";             echo "  $LOG_FILE"
     echo
     echo "=========================================="
+}
+
+cleanup() {
+    [[ -n "${TMP_SCAN:-}" && -f "${TMP_SCAN:-}" ]] && rm -f "$TMP_SCAN"
+    [[ -n "${SMALL_LIST:-}" && -f "${SMALL_LIST:-}" ]] && rm -f "$SMALL_LIST"
 }
 
 trap '
     echo
     log "Interrompido pelo usuário"
+    cleanup
     finish
     exit 130
 ' INT TERM
+trap cleanup EXIT
 
+# ------------------------------------------------------------ pré-checagens -
 if [[ ! -d "$DEST" ]]; then
-    echo "ERRO: destino não existe:"
-    echo "$DEST"
-    exit 1
+    echo "ERRO: destino não existe:"; echo "$DEST"; exit 1
 fi
-
 if ! mountpoint -q "$DEST"; then
-    echo "ERRO: VeraCrypt não parece montado em:"
-    echo "$DEST"
-    exit 1
+    echo "ERRO: VeraCrypt não parece montado em:"; echo "$DEST"; exit 1
 fi
-
 if [[ "$SOURCE" == "$DEST" ]]; then
-    echo "ERRO: origem e destino são iguais."
-    exit 1
+    echo "ERRO: origem e destino são iguais."; exit 1
 fi
 
 mkdir -p "$LOG_DIR"
-
 clear
 
 echo "=========================================="
 echo "                 FILLER"
 echo "=========================================="
 echo
-echo "ORIGEM:"
-echo "  $SOURCE"
+echo "ORIGEM:";           echo "  $SOURCE"
 echo
-echo "DESTINO:"
-echo "  $DEST"
+echo "DESTINO:";          echo "  $DEST"
 echo
-echo "ESPAÇO LIVRE:"
-echo "  $(human_bytes "$(available_bytes)")"
+echo "ESPAÇO LIVRE:";     echo "  $(human_bytes "$(available_bytes)")"
 echo
-echo "MARGEM RESERVADA:"
-echo "  $(human_bytes "$RESERVE_BYTES")"
+echo "MARGEM RESERVADA:"; echo "  $(human_bytes "$RESERVE_BYTES")"
+echo
+echo "ESTRATÉGIA:"
+echo "  mesmo FS  -> mv (instantâneo)"
+echo "  até $(human_bytes "$SMALL_MAX")  -> tar em lote (rápido p/ muitos arquivos)"
+echo "  acima     -> rsync por arquivo"
 echo
 echo "Os arquivos serão MOVIDOS."
 echo
@@ -192,128 +169,139 @@ echo
 
 while true; do
     read -r -p "Confirma? [S/n]: " CONFIRM
-
     case "${CONFIRM,,}" in
-        ""|s|sim|y|yes)
-            break
-            ;;
-
-        n|nao|não|no)
-            echo
-            echo "Operação cancelada."
-            exit 0
-            ;;
-
-        *)
-            echo "Digite S ou N."
-            ;;
+        ""|s|sim|y|yes) break ;;
+        n|nao|não|no)   echo; echo "Operação cancelada."; exit 0 ;;
+        *)              echo "Digite S ou N." ;;
     esac
 done
 
 touch "$LOG_FILE"
-
 log "Início"
 log "Origem: $SOURCE"
 log "Destino: $DEST"
 
-while IFS= read -r -d '' FILE; do
+# ------------------------------------------------------------ 1) varredura --
+TMP_SCAN="$(mktemp)"
+SMALL_LIST="$(mktemp)"
+
+# cada linha: "<tamanho>\t<caminho relativo>"
+( cd "$SOURCE" && find . -type f -printf '%s\t%P\n' ) > "$TMP_SCAN" 2>/dev/null || true
+
+TOTAL_FILES=$(wc -l < "$TMP_SCAN")
+
+echo
+echo "Varredura: $TOTAL_FILES arquivo(s)"
+log "Varredura: $TOTAL_FILES arquivo(s)"
+echo
+
+# ------------------------------------------------- 2) lote dos pequenos ----
+BUDGET=$(( $(available_bytes) - RESERVE_BYTES ))
+(( BUDGET < 0 )) && BUDGET=0
+
+: > "$SMALL_LIST"
+SEL_BYTES=0
+SEL_COUNT=0
+
+while IFS=$'\t' read -r size rel; do
+    [[ -n "$rel" ]] || continue
+    (( size <= SMALL_MAX )) || continue
+
+    if (( SEL_BYTES + size <= BUDGET )); then
+        printf '%s\n' "$rel" >> "$SMALL_LIST"
+        SEL_BYTES=$(( SEL_BYTES + size ))
+        (( SEL_COUNT++ ))
+    else
+        ((SKIPPED_FILES++))
+        log "NÃO CABE (lote): $rel"
+    fi
+done < "$TMP_SCAN"
+
+if (( SEL_COUNT > 0 )); then
+    echo "→ Lote (tar): $SEL_COUNT arquivo(s) · $(human_bytes "$SEL_BYTES")"
+    log "Lote: $SEL_COUNT arquivos, $(human_bytes "$SEL_BYTES")"
+
+    base=$(du -sb "$DEST" 2>/dev/null | awk '{print $1}'); base=${base:-0}
+
+    ( cd "$SOURCE" && tar -c -f - -T "$SMALL_LIST" 2>/dev/null | tar -x -f - -C "$DEST" ) &
+    pid=$!
+    watch "$pid" "$base" "$SEL_BYTES" "lote (tar)"
+    rc=$?
+
+    if (( rc == 0 )); then
+        # apaga as origens que foram para o lote
+        while IFS= read -r rel; do
+            [[ -n "$rel" ]] || continue
+            rm -f -- "$SOURCE/$rel"
+        done < "$SMALL_LIST"
+
+        # contabiliza pelo tamanho real já movido
+        MOVED_BYTES=$((MOVED_BYTES + SEL_BYTES))
+        MOVED_FILES=$((MOVED_FILES + SEL_COUNT))
+        while IFS= read -r rel; do log "MOVIDO (lote): $rel"; done < "$SMALL_LIST"
+        echo
+    else
+        ((FAILED_FILES += SEL_COUNT))
+        log "ERRO no lote (tar)"
+        echo
+        echo "  ⚠ falha no lote; arquivos do lote foram mantidos."
+    fi
+fi
+
+# --------------------------------------------------- 3) arquivos grandes ----
+while IFS=$'\t' read -r size rel; do
+    [[ -n "$rel" ]] || continue
+    (( size > SMALL_MAX )) || continue
+
+    FILE="$SOURCE/$rel"
     [[ -f "$FILE" ]] || continue
 
-    FILE_SIZE="$(stat -c '%s' "$FILE" 2>/dev/null)" || {
-        ((FAILED_FILES++))
-        log "ERRO stat: $FILE"
-        continue
-    }
+    free="$(available_bytes)"
+    [[ "$free" =~ ^[0-9]+$ ]] || { echo; echo "ERRO ao consultar espaço livre."; break; }
 
-    FREE="$(available_bytes)"
-
-    if [[ ! "$FREE" =~ ^[0-9]+$ ]]; then
-        echo
-        echo "ERRO ao consultar espaço livre."
-        break
-    fi
-
-    USABLE=$((FREE - RESERVE_BYTES))
-
-    if (( USABLE <= 0 )); then
+    if (( free - RESERVE_BYTES <= 0 )); then
         echo
         echo "Volume atingiu a margem de segurança."
-
         log "Volume cheio"
         break
     fi
-
-    if (( FILE_SIZE > USABLE )); then
+    if (( size > free - RESERVE_BYTES )); then
         ((SKIPPED_FILES++))
-
-        log "NÃO CABE: $FILE"
+        log "NÃO CABE: $rel"
         continue
     fi
 
-    REL="${FILE#"$SOURCE"/}"
-
-    TARGET="$DEST/$REL"
-
+    TARGET="$DEST/$rel"
     TARGET_DIR="$(dirname "$TARGET")"
-
-    mkdir -p "$TARGET_DIR" || {
-        ((FAILED_FILES++))
-        log "ERRO mkdir: $TARGET_DIR"
-        continue
-    }
+    mkdir -p "$TARGET_DIR" || { ((FAILED_FILES++)); log "ERRO mkdir: $TARGET_DIR"; continue; }
 
     if [[ -e "$TARGET" ]]; then
         ((SKIPPED_FILES++))
-
         log "JÁ EXISTE: $TARGET"
         continue
     fi
 
     if same_filesystem "$FILE" "$TARGET_DIR"; then
         if mv -- "$FILE" "$TARGET"; then
-            MOVED_BYTES=$((MOVED_BYTES + FILE_SIZE))
-            ((MOVED_FILES++))
-
-            log "MOVIDO: $REL"
+            MOVED_BYTES=$((MOVED_BYTES + size)); ((MOVED_FILES++))
+            log "MOVIDO: $rel"
         else
-            ((FAILED_FILES++))
-
-            log "ERRO mv: $FILE"
+            ((FAILED_FILES++)); log "ERRO mv: $rel"
         fi
     else
-        if rsync \
-            -a \
-            --whole-file \
-            --remove-source-files \
-            --protect-args \
-            -- \
-            "$FILE" \
-            "$TARGET"; then
-
-            MOVED_BYTES=$((MOVED_BYTES + FILE_SIZE))
-            ((MOVED_FILES++))
-
-            log "MOVIDO: $REL"
+        if rsync -a --whole-file --remove-source-files --protect-args -- "$FILE" "$TARGET"; then
+            MOVED_BYTES=$((MOVED_BYTES + size)); ((MOVED_FILES++))
+            log "MOVIDO: $rel"
         else
-            ((FAILED_FILES++))
-
-            log "ERRO rsync: $FILE"
+            ((FAILED_FILES++)); log "ERRO rsync: $rel"
         fi
     fi
 
     show_status
+done < "$TMP_SCAN"
 
-done < <(
-    find "$SOURCE" \
-        -type f \
-        -print0
-)
+# remove diretórios vazios que sobraram
+find "$SOURCE" -depth -type d -empty ! -path "$SOURCE" -delete 2>/dev/null || true
 
-find "$SOURCE" \
-    -depth \
-    -type d \
-    -empty \
-    ! -path "$SOURCE" \
-    -delete 2>/dev/null || true
-
+echo
 finish
