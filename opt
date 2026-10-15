@@ -35,12 +35,20 @@ Uso:
   opt filler
       Move arquivos da pasta atual para o volume VeraCrypt.
 
+  opt extract [pasta]
+  opt extrair
+  opt descompactar
+      Descompacta um arquivo .rar/.zip/.7z da pasta atual (e os
+      compactados que houver dentro dele), com painel de progresso.
+      Só roda se o arquivo estiver em um filesystem local.
+
 Exemplos:
 
   opt video "video.mp4"
   opt video
   opt image
   opt imagem
+  opt extract
   opt filler
 
 EOF
@@ -169,6 +177,75 @@ run_filler() {
     exec filler
 }
 
+# Caminho do descompactador (extract.sh, com painel visual).
+extract_engine() {
+    local c
+    for c in \
+        "${OPT_EXTRACT:-}" \
+        "/usr/local/bin/extract.sh" \
+        "$(dirname "$(command -v opt 2>/dev/null || echo /usr/local/bin/opt)")/extract.sh" \
+        "$HOME/extract.sh"
+    do
+        [[ -n "$c" && -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+    done
+    return 1
+}
+
+# Descompacta um arquivo da pasta atual (só se ele estiver num FS local).
+run_extract() {
+    shift || true
+
+    local dir="${1:-$PWD}"
+    local -a files=()
+    local f i n c fstype eng sel
+
+    shopt -s nullglob nocaseglob
+    for f in "$dir"/*.rar "$dir"/*.zip "$dir"/*.7z; do
+        files+=("$f")
+    done
+    shopt -u nullglob nocaseglob
+
+    if (( ${#files[@]} == 0 )); then
+        echo "Nenhum arquivo .rar/.zip/.7z em: $dir"
+        return 0
+    fi
+
+    echo
+    echo "Arquivos compactados em $dir:"
+    i=1
+    for f in "${files[@]}"; do
+        printf '  [%d] %-45s %s\n' "$i" "$(basename "$f")" "$(du -h "$f" 2>/dev/null | cut -f1)"
+        (( i++ ))
+    done
+    echo
+
+    read -r -p "Qual extrair? (número; Enter cancela): " n
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "Cancelado."; return 0; }
+    (( n >= 1 && n <= ${#files[@]} )) || { echo "Número inválido."; return 1; }
+
+    sel="${files[$((n-1))]}"
+
+    # só executa a extração se o arquivo estiver num sistema de arquivos LOCAL
+    fstype="$(stat -f -c %T "$sel" 2>/dev/null || echo desconhecido)"
+    case "$fstype" in
+        ext2/ext3|ext4|xfs|btrfs|zfs|overlay|tmpfs) ;;   # local: ok
+        *)
+            echo
+            echo "⚠ '$fstype' não é um sistema de arquivos local (rede/fuse)."
+            read -r -p "Continuar mesmo assim? [s/N]: " c
+            [[ "${c,,}" == s* ]] || { echo "Cancelado."; return 1; }
+            ;;
+    esac
+
+    if ! eng="$(extract_engine)"; then
+        echo "ERRO: extract.sh não encontrado."
+        echo "Instale-o em /usr/local/bin/extract.sh ou defina OPT_EXTRACT."
+        return 1
+    fi
+
+    exec "$eng" "$sel"
+}
+
 if [[ $# -gt 0 ]]; then
     case "${1,,}" in
         --classic|classic)
@@ -204,6 +281,10 @@ if [[ $# -gt 0 ]]; then
             run_filler
             ;;
 
+        extract|extrair|descompactar|unzip)
+            run_extract "$@"
+            ;;
+
         help|-h|--help|ajuda)
             show_help
             exit 0
@@ -237,17 +318,22 @@ echo "  [2] IMAGE"
 echo "      Otimiza JPG, PNG e WEBP da pasta atual"
 echo "      usando processamento paralelo."
 echo
-echo "  [3] FILLER"
+echo "  [3] EXTRAIR"
+echo "      Descompacta um arquivo .rar/.zip/.7z da pasta"
+echo "      atual (e os compactados internos), com painel"
+echo "      de progresso. Só roda se o arquivo for local."
+echo
+echo "  [4] FILLER"
 echo "      Move arquivos da pasta atual para o"
 echo "      volume VeraCrypt até ele ficar cheio."
 echo
-echo "  [4] AJUDA"
+echo "  [5] AJUDA"
 echo
 echo "  [0] SAIR"
 echo
 
 while true; do
-    read -r -p "Escolha [0-4]: " OPTION
+    read -r -p "Escolha [0-5]: " OPTION
 
     case "$OPTION" in
         1)
@@ -259,10 +345,14 @@ while true; do
             ;;
 
         3)
-            exec filler
+            run_extract
             ;;
 
         4)
+            exec filler
+            ;;
+
+        5)
             show_help
             exit 0
             ;;
@@ -272,7 +362,7 @@ while true; do
             ;;
 
         *)
-            echo "Escolha entre 0 e 4."
+            echo "Escolha entre 0 e 5."
             ;;
     esac
 done
